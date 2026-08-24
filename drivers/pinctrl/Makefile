@@ -4,6 +4,7 @@
 subdir-ccflags-$(CONFIG_DEBUG_PINCTRL)	+= -DDEBUG
 
 obj-y				+= core.o pinctrl-utils.o
+obj-$(CONFIG_CVITEK_PINCTRL_CV1835)	+= cvitek/
 obj-$(CONFIG_PINMUX)		+= pinmux.o
 obj-$(CONFIG_PINCONF)		+= pinconf.o
 obj-$(CONFIG_GENERIC_PINCONF)	+= pinconf-generic.o

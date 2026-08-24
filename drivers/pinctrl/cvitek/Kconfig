@@ -1,0 +1,10 @@
+config CVITEK_PINCTRL_CV1835
+	bool "Cvitek CV181x pinctrl MMIO map"
+	depends on PINCTRL
+	select PINMUX
+	select PINCONF
+	select GENERIC_PINCONF
+	help
+	  Same Kconfig name as Cube 5.10. Maps pinmux MMIO for DT
+	  compatibility. Probe does not rewrite pinmux; do not use this
+	  to change Cube AUD pins.

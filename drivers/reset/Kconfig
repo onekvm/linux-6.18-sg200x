@@ -392,6 +392,12 @@ config RESET_ZYNQMP
 	help
 	  This enables the reset controller driver for Xilinx ZynqMP SoCs.
 
+config RESET_CVITEK
+	bool "CVITEK SoC reset controller"
+	depends on HAS_IOMEM
+	help
+	  Reset controller for CVITEK CV181x / SG2002.
+
 source "drivers/reset/amlogic/Kconfig"
 source "drivers/reset/starfive/Kconfig"
 source "drivers/reset/sti/Kconfig"

@@ -24,6 +24,7 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/kstrtox.h>
+#include <linux/slab.h>
 #include <linux/usb/composite.h>
 
 #include "storage_common.h"
@@ -166,6 +167,44 @@ EXPORT_SYMBOL_GPL(fsg_ss_function);
  * the caller must own fsg->filesem for writing.
  */
 
+static void fsg_lun_free_direct_read_pool(struct fsg_lun *curlun)
+{
+	unsigned int i;
+
+	for (i = 0; i < curlun->direct_read_pool_slots; i++)
+		kfree(curlun->direct_read_pool[i]);
+	kfree(curlun->direct_read_pool);
+	curlun->direct_read_pool = NULL;
+	curlun->direct_read_pool_slots = 0;
+	curlun->direct_read_pool_valid = 0;
+	curlun->direct_read_window_slots = 0;
+}
+
+static int fsg_lun_alloc_direct_read_pool(struct fsg_lun *curlun)
+{
+	void **pool;
+	unsigned int i;
+
+	pool = kcalloc(FSG_DIRECT_READ_SLOTS, sizeof(*pool), GFP_KERNEL);
+	if (!pool)
+		return -ENOMEM;
+
+	curlun->direct_read_pool = pool;
+	for (i = 0; i < FSG_DIRECT_READ_SLOTS; i++) {
+		pool[i] = kmalloc(FSG_BUFLEN, GFP_KERNEL | __GFP_NOWARN);
+		if (!pool[i]) {
+			fsg_lun_free_direct_read_pool(curlun);
+			return -ENOMEM;
+		}
+		curlun->direct_read_pool_slots++;
+	}
+	curlun->direct_read_pool_valid = 0;
+	curlun->direct_read_window_slots = min(
+		(unsigned int)FSG_DIRECT_READ_MIN_SLOTS,
+		curlun->direct_read_pool_slots);
+	return 0;
+}
+
 void fsg_lun_close(struct fsg_lun *curlun)
 {
 	if (curlun->filp) {
@@ -173,6 +212,7 @@ void fsg_lun_close(struct fsg_lun *curlun)
 		fput(curlun->filp);
 		curlun->filp = NULL;
 	}
+	fsg_lun_free_direct_read_pool(curlun);
 }
 EXPORT_SYMBOL_GPL(fsg_lun_close);
 
@@ -187,6 +227,7 @@ int fsg_lun_open(struct fsg_lun *curlun, const char *filename)
 	loff_t				min_sectors;
 	unsigned int			blkbits;
 	unsigned int			blksize;
+	struct block_device		*bdev;
 
 	/* R/W if we can, R/O if we must */
 	ro = curlun->initially_ro;
@@ -241,16 +282,7 @@ int fsg_lun_open(struct fsg_lun *curlun, const char *filename)
 	}
 
 	num_sectors = size >> blkbits; /* File size in logic-block-size blocks */
-	min_sectors = 1;
-	if (curlun->cdrom) {
-		min_sectors = 300;	/* Smallest track is 300 frames */
-		if (num_sectors >= 256*60*75) {
-			num_sectors = 256*60*75 - 1;
-			LINFO(curlun, "file too big: %s\n", filename);
-			LINFO(curlun, "using only first %d blocks\n",
-					(int) num_sectors);
-		}
-	}
+	min_sectors = curlun->cdrom ? 300 : 1; /* Smallest track is 300 frames */
 	if (num_sectors < min_sectors) {
 		LINFO(curlun, "file too small: %s\n", filename);
 		rc = -ETOOSMALL;
@@ -259,6 +291,28 @@ int fsg_lun_open(struct fsg_lun *curlun, const char *filename)
 
 	if (fsg_lun_is_open(curlun))
 		fsg_lun_close(curlun);
+
+	/*
+	 * The dedicated OneKVM NBD path can fill the mass-storage USB buffer
+	 * directly through BIO.  Other block devices and regular files retain the
+	 * standard buffered kernel_read() path.
+	 */
+	bdev = S_ISBLK(inode->i_mode) ? I_BDEV(inode) : NULL;
+	curlun->no_page_cache = ro && bdev && bdev->bd_disk &&
+		!strncmp(bdev->bd_disk->disk_name, "onekvm-nbd",
+			 sizeof("onekvm-nbd") - 1);
+	if (curlun->no_page_cache) {
+		if (fsg_lun_alloc_direct_read_pool(curlun)) {
+			curlun->no_page_cache = 0;
+			LWARN(curlun, "direct BIO pool unavailable; using buffered reads\n");
+		} else {
+			LINFO(curlun, "using 512 KiB direct BIO read pool for NBD backing device\n");
+		}
+	}
+
+	/* Too big CD-ROM images will be handled as DVD-ROM */
+	curlun->cd_as_dvd = curlun->cdrom &&
+		(num_sectors >= CD_MAX_MSF_SECTORS);
 
 	curlun->blksize = blksize;
 	curlun->blkbits = blkbits;

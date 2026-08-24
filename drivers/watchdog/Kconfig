@@ -606,6 +606,13 @@ config DW_WATCHDOG
 	  To compile this driver as a module, choose M here: the
 	  module will be called dw_wdt.
 
+config ICE_WDT
+	tristate "ICE+ Watchdog"
+	depends on RISCV
+	select WATCHDOG_CORE
+	help
+	  Hardware watchdog on T-Head C906 / ICE+ (SG2002).
+
 config EP93XX_WATCHDOG
 	tristate "EP93xx Watchdog"
 	depends on ARCH_EP93XX || COMPILE_TEST

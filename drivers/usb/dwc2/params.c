@@ -336,6 +336,8 @@ const struct of_device_id dwc2_of_match_table[] = {
 	{ .compatible = "apm,apm82181-dwc-otg", .data = dwc2_set_amcc_params },
 	{ .compatible = "sophgo,cv1800b-usb",
 	  .data = dwc2_set_cv1800_params },
+	{ .compatible = "cvitek,cv182x-usb",
+	  .data = dwc2_set_cv182x_params },
 	{ .compatible = "st,stm32f4x9-fsotg",
 	  .data = dwc2_set_stm32f4x9_fsotg_params },
 	{ .compatible = "st,stm32f4x9-hsotg" },
