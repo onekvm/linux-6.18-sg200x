@@ -58,6 +58,12 @@ config DWMAC_GENERIC
 	  platform specific code to function or is using platform
 	  data for setup.
 
+config DWMAC_CVITEK
+	tristate "CVITEK DWMAC support"
+	depends on OF
+	help
+	  Support for CVITEK / Sophgo CV181x (SG2002) DWMAC Ethernet.
+
 config DWMAC_ANARION
 	tristate "Adaptrum Anarion GMAC support"
 	default ARC

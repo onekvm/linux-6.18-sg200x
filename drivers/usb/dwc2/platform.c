@@ -23,6 +23,7 @@
 #include "core.h"
 #include "hcd.h"
 #include "debug.h"
+#include "cviusb.h"
 
 static const char dwc2_driver_name[] = "dwc2";
 
@@ -112,6 +113,7 @@ static int __dwc2_lowlevel_hw_enable(struct dwc2_hsotg *hsotg)
 		if (ret)
 			goto err_dis_utmi_clk;
 	}
+	dwc2_cviusb_clk_enable(hsotg);
 
 	if (hsotg->uphy) {
 		ret = usb_phy_init(hsotg->uphy);
@@ -134,6 +136,7 @@ static int __dwc2_lowlevel_hw_enable(struct dwc2_hsotg *hsotg)
 err_dis_clk:
 	if (hsotg->clk)
 		clk_disable_unprepare(hsotg->clk);
+	dwc2_cviusb_clk_disable(hsotg);
 
 err_dis_utmi_clk:
 	if (hsotg->utmi_clk)
@@ -351,6 +354,8 @@ static void dwc2_driver_remove(struct platform_device *dev)
 
 	if (hsotg->ll_hw_enabled)
 		dwc2_lowlevel_hw_disable(hsotg);
+
+	dwc2_cviusb_remove(hsotg);
 }
 
 /**
@@ -480,9 +485,13 @@ static int dwc2_driver_probe(struct platform_device *dev)
 			return retval;
 	}
 
-	retval = dwc2_lowlevel_hw_enable(hsotg);
+	retval = dwc2_cviusb_probe(hsotg, dev);
 	if (retval)
 		return retval;
+
+	retval = dwc2_lowlevel_hw_enable(hsotg);
+	if (retval)
+		goto error_cviusb;
 
 	hsotg->needs_byte_swap = dwc2_check_core_endianness(hsotg);
 
@@ -643,6 +652,8 @@ error_init:
 error:
 	if (hsotg->ll_hw_enabled)
 		dwc2_lowlevel_hw_disable(hsotg);
+error_cviusb:
+	dwc2_cviusb_remove(hsotg);
 	return retval;
 }
 

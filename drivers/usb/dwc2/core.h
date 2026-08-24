@@ -15,6 +15,7 @@
 #include <linux/usb/otg.h>
 #include <linux/usb/phy.h>
 #include "hw.h"
+#include "cviusb.h"
 
 /*
  * Suggested defines for tracers:
@@ -1056,6 +1057,7 @@ struct dwc2_hregs_backup {
 struct dwc2_hsotg {
 	struct device *dev;
 	void __iomem *regs;
+	struct cviusb_dev cviusb;
 	/** Params detected from hardware */
 	struct dwc2_hw_params hw_params;
 	/** Params to actually use */

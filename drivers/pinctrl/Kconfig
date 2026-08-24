@@ -713,6 +713,7 @@ source "drivers/pinctrl/tegra/Kconfig"
 source "drivers/pinctrl/ti/Kconfig"
 source "drivers/pinctrl/uniphier/Kconfig"
 source "drivers/pinctrl/visconti/Kconfig"
+source "drivers/pinctrl/cvitek/Kconfig"
 source "drivers/pinctrl/vt8500/Kconfig"
 
 endif

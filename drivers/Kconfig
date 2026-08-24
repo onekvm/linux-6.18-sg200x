@@ -223,6 +223,8 @@ source "drivers/dax/Kconfig"
 
 source "drivers/nvmem/Kconfig"
 
+source "drivers/efuse/Kconfig"
+
 source "drivers/hwtracing/Kconfig"
 
 source "drivers/fpga/Kconfig"

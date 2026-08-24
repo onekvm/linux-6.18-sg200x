@@ -762,6 +762,8 @@ source "drivers/dma/dw/Kconfig"
 
 source "drivers/dma/dw-edma/Kconfig"
 
+source "drivers/dma/cvitek/Kconfig"
+
 source "drivers/dma/hsu/Kconfig"
 
 source "drivers/dma/sf-pdma/Kconfig"

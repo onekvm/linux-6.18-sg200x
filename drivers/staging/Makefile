@@ -2,6 +2,7 @@
 # Makefile for staging directory
 
 obj-y				+= media/
+obj-$(CONFIG_ION)		+= android/
 obj-$(CONFIG_RTL8723BS)		+= rtl8723bs/
 obj-$(CONFIG_OCTEON_ETHERNET)	+= octeon/
 obj-$(CONFIG_VME_BUS)		+= vme_user/

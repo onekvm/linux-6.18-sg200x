@@ -85,6 +85,19 @@ do {									\
 #define SS_WRITE_ERROR				0x030c02
 #define SS_WRITE_PROTECTED			0x072700
 
+/* Some used profiles from MMC-3 */
+#define MMC_PROFILE_NONE		0x0000
+#define MMC_PROFILE_CD_ROM		0x0008
+#define MMC_PROFILE_DVD_ROM		0x0010
+
+/*
+ * Maximum number of sectors of CD with MSF addressing.
+ * A bit paranoid value is calculated based on standard
+ * and store_cdrom_address() implementation.
+ * It is assumed that bigger images will be handled as DVD.
+ */
+#define CD_MAX_MSF_SECTORS	((255 * 59 * 74) - (2 * 75))
+
 #define SK(x)		((u8) ((x) >> 16))	/* Sense Key byte, etc. */
 #define ASC(x)		((u8) ((x) >> 8))
 #define ASCQ(x)		((u8) (x))
@@ -104,6 +117,8 @@ struct fsg_lun {
 	unsigned int	ro:1;
 	unsigned int	removable:1;
 	unsigned int	cdrom:1;
+	unsigned int	cd_as_dvd:1; /* Handle big CD as DVD if cdrom == 1 */
+	unsigned int	no_page_cache:1; /* Direct BIO for dedicated NBD */
 	unsigned int	prevent_medium_removal:1;
 	unsigned int	registered:1;
 	unsigned int	info_valid:1;
@@ -119,6 +134,11 @@ struct fsg_lun {
 	struct device	dev;
 	const char	*name;		/* "lun.name" */
 	const char	**name_pfx;	/* "function.name" */
+	void		**direct_read_pool;
+	unsigned int	direct_read_pool_slots;
+	loff_t		direct_read_pool_start;
+	unsigned int	direct_read_pool_valid;
+	unsigned int	direct_read_window_slots;
 	char		inquiry_string[INQUIRY_STRING_LEN];
 };
 
@@ -129,6 +149,8 @@ static inline bool fsg_lun_is_open(struct fsg_lun *curlun)
 
 /* Default size of buffer length. */
 #define FSG_BUFLEN	((u32)16384)
+#define FSG_DIRECT_READ_MIN_SLOTS	8
+#define FSG_DIRECT_READ_SLOTS		32
 
 /* Maximal number of LUNs supported in mass storage function */
 #define FSG_MAX_LUNS	(US_BULK_MAX_LUN_LIMIT + 1)

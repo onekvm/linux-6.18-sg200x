@@ -220,6 +220,11 @@ config CICADA_PHY
 	help
 	  Currently supports the cis8204
 
+config CVITEK_PHY
+	tristate "CVITEK internal RMII PHY"
+	help
+	  Internal 100M PHY on SG2002 / CV181x.
+
 config CORTINA_PHY
 	tristate "Cortina EDC CDR 10G Ethernet PHY"
 	help

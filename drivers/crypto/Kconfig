@@ -876,4 +876,11 @@ source "drivers/crypto/starfive/Kconfig"
 source "drivers/crypto/inside-secure/eip93/Kconfig"
 source "drivers/crypto/ti/Kconfig"
 
+config CRYPTO_DEV_CVITEK_SPACC
+	tristate "Support for CVITEK SPACC"
+	depends on HAS_IOMEM
+	help
+	  CryptoDMA character device for CVITEK/SG2002. Built as a
+	  module so OneKVM can load it next to onekvm_crypto_offload.
+
 endif # CRYPTO_HW

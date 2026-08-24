@@ -1,0 +1,108 @@
+# Allowlist for scripts/onekvm-check-510-kconfig.py
+# Shared NanoKVM 5.10 symbols not listed here must match the 5.10 .config.
+# 6.18-only enabled symbols not listed here fail the check (VMAP_STACK class).
+# Toolchain / CC_HAS_* symbols are ignored by the script.
+
+# --- shared mismatches we keep ---
+# systemd 261 needs these; 5.10 Cube left them off.
+FHANDLE=y
+CGROUP_FREEZER=y
+# 8250 OF UART; 5.10 used a different 8250 path.
+SERIAL_OF_PLATFORM=y
+# 5.10 recipe writes -onekvm at make time; overlay stores it in kconfig.
+LOCALVERSION="-onekvm"
+# Cube has no HDMI audio. 5.10 nfs.cfg left cvitek ASoC =m; 5.15 objects
+# fail modpost, and AUD pinmux must not change.
+CV1835_I2S_SUBSYS=n
+SND_CV1835_I2S=n
+SND_SOC_CV182XAADC=n
+SND_SOC_CV182XADAC=n
+SND_SOC_CV182XA_CV182XAADC=n
+SND_SOC_CV182XA_CV182XADAC=n
+SND_SOC_CV1835_USE_AUDIO_PLL=n
+SND_HDA_PREALLOC_SIZE=0
+# The vendor DTS describes a DesignWare watchdog. ICE_WDT has no matching
+# device node on SG2002 NanoKVM.
+DW_WATCHDOG=y
+ICE_WDT=n
+# Mainline CV1800 RTCSYS/RTC backport; 5.10 left the RTC node unbound.
+MFD_CORE=y
+ARCH_SOPHGO=y
+# Incidental 6.18 defaults that 5.10 had off; not DMA/stack.
+AX88796B_PHY=m
+CRYPTO_LIB_BLAKE2S_GENERIC=y
+CRYPTO_SHA512=m
+PERF_EVENTS=y
+POWER_SUPPLY=y
+THERMAL_GOV_USER_SPACE=y
+# One kernel can switch none/voluntary/full preemption at run time.
+JUMP_LABEL=y
+PREEMPT_DYNAMIC=y
+SCHED_DEBUG=y
+
+# --- 6.18-only enabled (absent from 5.10 .config) ---
+# Capability / selected-only / toolchain-adjacent.
+AF_UNIX_OOB=y
+ARCH_HAS_FORTIFY_SOURCE=y
+ARCH_HAS_NON_OVERLAPPING_ADDRESS_SPACE=y
+ARCH_HAS_STRICT_MODULE_RWX=y
+ARCH_HAS_UBSAN_SANITIZE_ALL=y
+ARCH_SUPPORTS_HUGETLBFS=y
+ARCH_USE_MEMTEST=y
+BINARY_PRINTF=y
+BLOCK_HOLDER_DEPRECATED=y
+BLOCK_LEGACY_AUTOLOAD=y
+BUILDTIME_TABLE_SORT=y
+CPU_MITIGATIONS=y
+CRYPTO_LIB_SM4=m
+DVB_MXL692=m
+FWNODE_MDIO=y
+GENERIC_ARCH_TOPOLOGY=y
+GENERIC_IDLE_POLL_SETUP=y
+GENERIC_IRQ_SHOW_LEVEL=y
+GENERIC_LIB_DEVMEM_IS_ALLOWED=y
+HAVE_ARCH_KASAN_VMALLOC=y
+HAVE_ARCH_KFENCE=y
+HAVE_ARCH_THREAD_STRUCT_WHITELIST=y
+HAVE_ARCH_TRANSPARENT_HUGEPAGE=y
+HAVE_ARCH_VMAP_STACK=y
+HAVE_FUNCTION_ARG_ACCESS_API=y
+HAVE_IRQ_TIME_ACCOUNTING=y
+HAVE_PREEMPT_DYNAMIC=y
+HAVE_PREEMPT_DYNAMIC_KEY=y
+HAVE_MOVE_PMD=y
+HAVE_MOVE_PUD=y
+INET_TABLE_PERTURB_ORDER=16
+IRQ_FORCED_THREADING=y
+LIB_MEMNEQ=y
+LTO_NONE=y
+MODULES_TREE_LOOKUP=y
+MODULE_COMPRESS_NONE=y
+NET_SELFTESTS=y
+NET_SOCK_MSG=y
+NET_VENDOR_LITEX=y
+NET_VENDOR_MICROSOFT=y
+NF_FLOW_TABLE_PROCFS=y
+NF_LOG_SYSLOG=m
+# Ported drivers; 5.10 used different Kconfig names or in-tree glue.
+POWER_RESET_CVITEK=y
+POWER_SUPPLY_HWMON=y
+PROC_MEM_ALWAYS_FORCE=y
+PTP_1588_CLOCK_OPTIONAL=y
+RESET_CVITEK=y
+RISCV_BASE_PMU=y
+RISCV_ERRATA_ALTERNATIVE=y
+RTC_DRV_CV1800=y
+I2C_DESIGNWARE_CORE=y
+I2C_DESIGNWARE_PLATFORM=y
+SCSI_COMMON=y
+SOPHGO_CV1800_RTCSYS=y
+STACKPROTECTOR_PER_TASK=y
+STRICT_MODULE_RWX=y
+# 6.18 RISC-V selects SWIOTLB for this MMU configuration; 5.10 had
+# RISCV_SWIOTLB=n. Bounce=0 on Cube.
+SWIOTLB=y
+SYSFB=y
+USB_RTL8153_ECM=m
+V4L2_ASYNC=y
+VIDEOBUF2_DMA_SG=y
