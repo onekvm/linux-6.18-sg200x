@@ -874,7 +874,7 @@ static int cvitek_spacc_drv_probe(struct platform_device *pdev)
 
 	if (ret > 0) {
 		ret = devm_request_irq(dev, ret, cvitek_spacc_irq,
-				IRQF_SHARED | IRQF_TRIGGER_RISING,
+				IRQF_SHARED,
 				pdev->name, spacc);
 		if (ret) {
 			pr_err("request irq failed\n");

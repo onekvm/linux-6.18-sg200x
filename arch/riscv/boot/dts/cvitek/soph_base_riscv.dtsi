@@ -32,6 +32,14 @@
 	#size-cells = <0x2>;
 	#address-cells = <0x2>;
 
+	spacc: crypto@2060000 {
+		compatible = "cvitek,spacc";
+		reg = <0x0 0x02060000 0x0 0x200>;
+		interrupts = <59 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-parent = <&plic0>;
+		status = "okay";
+	};
+
 	cpus {
 		#address-cells = <0x01>;
 		#size-cells = <0x00>;
