@@ -186,12 +186,17 @@
         /delete-property/ mute-gpio-r;
 };
 
-/* NanoKVM has no CVI display output.  Keep the production 48 MiB ION
- * carveout used by the 5.15 image and return the framebuffer reservation to
- * Linux.  The independent PCIe/Cube OLED does not use this framebuffer.
+/* NanoKVM has no CVI display output.  1440p H.264 needs ~51 MiB of ION
+ * (UYVY×3 + NV21 VPSS×3 + WAVE4 recon); the old 48 MiB top-of-DRAM
+ * carveout at 0x8ce00000 was too small.  U-Boot still parks the FIT
+ * ramdisk/FDT around 0x8c01d000-0x8c43d6da and does not honor this
+ * reserved-memory node (it logs "reserving fdt memory region failed"),
+ * so ION must not cover that window and cannot grow downward from
+ * 0x8fe00000 to 64 MiB.  Place 64 MiB below the U-Boot load area.
+ * C906L stays at 0x8fe00000.  The OLED does not use the framebuffer.
  */
 &ion_reserved {
-	reg = <0x0 0x8ce00000 0x0 0x03000000>;
+	reg = <0x0 0x85000000 0x0 0x04000000>;
 	/delete-property/ size;
 };
 
