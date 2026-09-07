@@ -36,9 +36,6 @@
 #define DEVICE_NAME    "spacc"
 #define CVITEK_SPACC_KERNEL_BUFFER_SIZE (32 * 1024)
 
-static char flag = 'n';
-static DECLARE_WAIT_QUEUE_HEAD(wq);
-
 struct cvi_spacc {
 	struct device *dev;
 	struct cdev cdev;
@@ -56,7 +53,6 @@ struct cvi_spacc {
 	void *kernel_buffer;
 	u32 kernel_buffer_size;
 	u32 *descriptor;
-	bool irq_available;
 
 #ifdef CONFIG_PM_SLEEP
 	struct clk *efuse_clk;
@@ -132,39 +128,31 @@ static inline void cvi_sha1_init(struct cvi_spacc *spacc)
 
 static inline int trigger_cryptodma_engine_and_wait_finish(struct cvi_spacc *spacc)
 {
-	long wait_result;
 	u32 status;
-	unsigned int attempt;
-	// Set cryptodma control
+	unsigned long deadline;
+
 	iowrite32(0x7, spacc->spacc_base + CRYPTODMA_INT_MASK);
-
-	// Clear interrupt
-	// Important!!! must do this
+	/* Important!!! must do this */
 	iowrite32(0x7, spacc->spacc_base + CRYPTODMA_WR_INT);
-	flag = 'n';
 
-	// Trigger cryptodma engine
 	iowrite32(DMA_WRITE_MAX_BURST << 24 |
 			  DMA_READ_MAX_BURST << 16 |
 			  DMA_DESCRIPTOR_MODE << 1 | DMA_ENABLE, spacc->spacc_base + CRYPTODMA_DMA_CTRL);
 
-	if (spacc->irq_available) {
-		wait_result = wait_event_interruptible_timeout(wq, flag == 'y',
-							      msecs_to_jiffies(1000));
-		flag = 'n';
-		if (wait_result < 0)
-			return wait_result;
-		if (!wait_result)
-			return -ETIMEDOUT;
-		return 0;
-	}
-
-	for (attempt = 0; attempt < 1000000; ++attempt) {
+	/*
+	 * Completion is WR_INT, not the DT IRQ. 107's DTB wires PLIC 59
+	 * (IRQ_TYPE_LEVEL_HIGH) but that line never fires, so wait_event
+	 * for 1 s stalled every SRTP batch at 1 FPS. Always poll WR_INT.
+	 * Do not wait_event: a late/wrong IRQ handler would clear WR_INT
+	 * and lose the completion we are polling.
+	 */
+	deadline = jiffies + msecs_to_jiffies(20);
+	do {
 		status = ioread32(spacc->spacc_base + CRYPTODMA_WR_INT);
 		if (status)
 			return 0;
 		cpu_relax();
-	}
+	} while (time_before(jiffies, deadline));
 	return -ETIMEDOUT;
 }
 
@@ -291,18 +279,6 @@ static inline void setup_action(u32 *dma_descriptor, SPACC_ACTION_E action)
 {
 	if (action == SPACC_ACTION_ENCRYPTION)
 		dma_descriptor[CRYPTODMA_CIPHER] |= 0x1;
-}
-
-static irqreturn_t cvitek_spacc_irq(int irq, void *data)
-{
-	struct cvi_spacc *spacc = (struct cvi_spacc *)data;
-
-	iowrite32(0x7, spacc->spacc_base + CRYPTODMA_WR_INT);
-
-	flag = 'y';
-	wake_up_interruptible(&wq);
-
-	return IRQ_HANDLED;
 }
 
 int spacc_sha256(struct cvi_spacc *spacc, uintptr_t src, uint32_t len)
@@ -873,14 +849,9 @@ static int cvitek_spacc_drv_probe(struct platform_device *pdev)
 #endif
 
 	if (ret > 0) {
-		ret = devm_request_irq(dev, ret, cvitek_spacc_irq,
-				IRQF_SHARED,
-				pdev->name, spacc);
-		if (ret) {
-			pr_err("request irq failed\n");
-			return ret;
-		}
-		spacc->irq_available = true;
+		/* DT IRQ 59 never completes on SG2002; requesting it would
+		 * let a stray handler clear WR_INT while the engine polls. */
+		dev_info(dev, "ignoring DT IRQ %d, polling WR_INT\n", ret);
 	} else {
 		dev_info(dev, "no routed IRQ, using completion polling\n");
 	}
