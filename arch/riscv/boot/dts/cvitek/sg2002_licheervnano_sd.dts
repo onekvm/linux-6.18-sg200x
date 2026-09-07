@@ -15,18 +15,9 @@
         /delete-property/ sda-gpios;
 };
 
-/* NanoKVM HDMI bridge enable.  Linux 6.11 removed the legacy GPIO sysfs
- * ABI, so describe the board-fixed output instead of exporting GPIO451
- * (GPIOB3) from the MMF startup script.
+/* GPIOB3 is the PCIe HDMI bridge enable / HPD pulse. MMF owns it through
+ * gpio cdev (`onekvm-mmf-hdmi`) so EDID writes can hotplug. Do not hog it.
  */
-&portb {
-	hdmi-enable-hog {
-		gpio-hog;
-		gpios = <3 GPIO_ACTIVE_HIGH>;
-		output-high;
-		line-name = "nanokvm-hdmi-enable";
-	};
-};
 
 &i2c1 {
         status = "okay";
