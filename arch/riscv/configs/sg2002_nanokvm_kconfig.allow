@@ -35,6 +35,12 @@ CRYPTO_SHA512=m
 PERF_EVENTS=y
 POWER_SUPPLY=y
 THERMAL_GOV_USER_SPACE=y
+# Report C906 clock via cpufreq sysfs for lscpu; no runtime scaling.
+CPU_FREQ=y
+CPU_FREQ_STAT=y
+CPU_FREQ_DEFAULT_GOV_PERFORMANCE=y
+CPU_FREQ_GOV_PERFORMANCE=y
+CPUFREQ_CVITEK=y
 # One kernel can switch none/voluntary/full preemption at run time.
 JUMP_LABEL=y
 PREEMPT_DYNAMIC=y
