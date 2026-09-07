@@ -41,7 +41,8 @@ static int cvitek_cpufreq_init(struct cpufreq_policy *policy)
 		return -ENODEV;
 
 	policy->clk = cpu_clk;
-	cpufreq_generic_init(policy, freq_table, CPUFREQ_ETERNAL);
+	/* Report-only: no hardware transition, so latency is unused. */
+	cpufreq_generic_init(policy, freq_table, 0);
 	return 0;
 }
 
