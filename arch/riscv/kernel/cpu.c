@@ -362,13 +362,27 @@ static int c_show(struct seq_file *m, void *v)
 	print_mmu(m);
 
 	if (acpi_disabled) {
+		const char *model_name = NULL;
+
 		node = of_get_cpu_node(cpu_id, NULL);
+		if (node) {
+			of_property_read_string(node, "compatible", &compat);
+			of_property_read_string(node, "model-name", &model_name);
 
-		if (!of_property_read_string(node, "compatible", &compat) &&
-		    strcmp(compat, "riscv"))
-			seq_printf(m, "uarch\t\t: %s\n", compat);
+			/*
+			 * lscpu maps both "model name" and "uarch" onto Model
+			 * name. Prefer the readable model-name so the summary
+			 * is not "thead,c906", and skip uarch in that case:
+			 * emitting both makes util-linux invent a second CPU
+			 * type.
+			 */
+			if (model_name)
+				seq_printf(m, "model name\t: %s\n", model_name);
+			else if (compat && strcmp(compat, "riscv"))
+				seq_printf(m, "uarch\t\t: %s\n", compat);
 
-		of_node_put(node);
+			of_node_put(node);
+		}
 	}
 
 	seq_printf(m, "mvendorid\t: 0x%lx\n", ci->mvendorid);

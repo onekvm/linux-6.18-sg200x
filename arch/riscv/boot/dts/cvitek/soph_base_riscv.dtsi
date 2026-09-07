@@ -59,8 +59,9 @@
 			device_type = "cpu";
 			reg = <0x00>;
 			status = "okay";
-			/* First compatible becomes /proc/cpuinfo "uarch" and lscpu Model name. */
 			compatible = "thead,c906", "riscv";
+			/* /proc/cpuinfo "model name" and lscpu Model name. */
+			model-name = "T-Head XuanTie C906 (Sophgo SG2002)";
 			/* C906 implements draft XTheadVector, not ratified V 1.0. */
 			riscv,isa = "rv64imafdcsu";
 			mmu-type = "riscv,sv39";
