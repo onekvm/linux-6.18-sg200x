@@ -10,9 +10,7 @@
 #include <linux/genalloc.h>
 #include <linux/io.h>
 #include <linux/mm.h>
-#include <linux/proc_fs.h>
 #include <linux/scatterlist.h>
-#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/of.h>
@@ -25,43 +23,6 @@ struct ion_carveout_heap {
 	struct gen_pool *pool;
 	phys_addr_t base;
 };
-
-#ifdef CONFIG_ION_CVITEK
-static unsigned long ion_carveout_managed_pages;
-
-/*
- * reserved-memory ion-region stays out of the buddy allocator, so it is
- * missing from MemTotal. Count the mapped pages as managed but not free
- * so free(1)/htop show them as used kernel memory. A kthread cannot own
- * this range: it has no userspace RSS, and MMF still allocates from the
- * carveout by physical address.
- */
-static void ion_carveout_account_managed(phys_addr_t base, size_t size)
-{
-	unsigned long pfn = PFN_DOWN(base);
-	unsigned long end = PFN_DOWN(base + size);
-	unsigned long counted = 0;
-
-	if (!size)
-		return;
-
-	for (; pfn < end; pfn++) {
-		if (!pfn_valid(pfn))
-			continue;
-		adjust_managed_page_count(pfn_to_page(pfn), 1);
-		counted++;
-	}
-	ion_carveout_managed_pages += counted;
-	pr_info("ion carveout: %lu MiB counted in MemTotal as used\n",
-		counted >> (20 - PAGE_SHIFT));
-}
-
-void arch_report_meminfo(struct seq_file *m)
-{
-	seq_printf(m, "IonCarveout:     %8lu kB\n",
-		   ion_carveout_managed_pages << (PAGE_SHIFT - 10));
-}
-#endif
 
 static phys_addr_t ion_carveout_allocate(struct ion_heap *heap,
 					 unsigned long size)
@@ -242,7 +203,6 @@ struct ion_heap *ion_carveout_heap_create(struct ion_platform_heap *heap_data)
     carveout_heap->heap.name = heap_data->name;
 #ifdef CONFIG_ION_CVITEK
 	carveout_heap->heap.total_size = heap_data->size;
-	ion_carveout_account_managed(heap_data->base, heap_data->size);
 #endif
 	return &carveout_heap->heap;
 }
