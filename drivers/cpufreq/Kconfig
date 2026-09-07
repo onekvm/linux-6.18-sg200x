@@ -253,6 +253,16 @@ config CPUFREQ_DT_PLATDEV
 
 	  If in doubt, say N.
 
+config CPUFREQ_CVITEK
+	bool "Cvitek/Sophgo CV181x/SG200x CPU frequency reporting"
+	depends on CPU_FREQ && COMMON_CLK_CVITEK
+	help
+	  Report the C906 clock through cpufreq sysfs so tools such as
+	  lscpu can print CPU min/max MHz. This driver does not change
+	  the CPU rate; C906 mux/PLL updates need an XTAL bypass.
+
+	  If in doubt, say N.
+
 if X86
 source "drivers/cpufreq/Kconfig.x86"
 endif

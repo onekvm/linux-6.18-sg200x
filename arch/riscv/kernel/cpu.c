@@ -4,6 +4,7 @@
  */
 
 #include <linux/acpi.h>
+#include <linux/clk.h>
 #include <linux/cpu.h>
 #include <linux/ctype.h>
 #include <linux/init.h>
@@ -335,6 +336,20 @@ static int c_show(struct seq_file *m, void *v)
 
 	seq_printf(m, "processor\t: %lu\n", cpu_id);
 	seq_printf(m, "hart\t\t: %lu\n", cpuid_to_hartid_map(cpu_id));
+
+	if (IS_ENABLED(CONFIG_COMMON_CLK)) {
+		struct clk *cpu_clk = clk_get(NULL, "clk_c906_0");
+
+		if (!IS_ERR(cpu_clk)) {
+			unsigned long rate = clk_get_rate(cpu_clk);
+
+			if (rate)
+				seq_printf(m, "cpu MHz\t\t: %lu.%03lu\n",
+					   rate / 1000000,
+					   (rate / 1000) % 1000);
+			clk_put(cpu_clk);
+		}
+	}
 
 	/*
 	 * For historical raisins, the isa: line is limited to the lowest common
