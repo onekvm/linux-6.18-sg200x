@@ -37,6 +37,61 @@ config ARCH_SOPHGO
 	help
 	  This enables support for Sophgo SoC platform hardware.
 
+menu "Cvitek platform settings"
+	depends on ARCH_SOPHGO
+
+config ION_SIZE_MIB
+	int "ION carveout size (MiB)" if ION_CVITEK
+	range 22 112
+	default 48
+	help
+	  Size of the physically contiguous multimedia carveout used by the
+	  video pipeline. The device-tree build calculates a safe base address
+	  automatically and rejects layouts which overlap the kernel/FIT load
+	  area, U-Boot's runtime/FIT window, or the C906L reservation.
+
+	  The default is 48 MiB. Larger video modes may require increasing this;
+	  the NanoKVM SG2002 configuration uses 64 MiB.
+
+config RTOS_RAM_SIZE_MIB
+	int "C906L RTOS RAM size (MiB)"
+	range 1 16
+	default 2
+	help
+	  Size of the top-of-DRAM region reserved for the C906L firmware and
+	  its Linux IPC windows. The device-tree build derives the C906L base
+	  address and Linux-visible memory size from this value.
+
+	  The C906L firmware and FSBL memory map must be built with the same
+	  value. The default is 2 MiB.
+
+config FRAMEBUFFER_RESERVE
+	bool "Reserve framebuffer memory"
+	help
+	  Reserve a physically contiguous framebuffer region and enable the
+	  Cvitek framebuffer device-tree nodes. Disable this on boards without
+	  a display output so Linux can use the memory.
+
+config FRAMEBUFFER_SIZE_MIB
+	int "Framebuffer size (MiB)"
+	depends on FRAMEBUFFER_RESERVE
+	range 1 32
+	default 8
+	help
+	  Size of the physically contiguous framebuffer reservation. The
+	  device-tree build places it in a safe arena which does not overlap
+	  ION, U-Boot/FIT, or C906L memory.
+
+config GPIO_I2C_DELAY_US
+	int "GPIO bit-banged I2C delay (us)"
+	range 1 100
+	default 5
+	help
+	  Delay between GPIO transitions on the bit-banged I2C bus. A lower
+	  value increases the bus frequency. The default is 5 microseconds.
+
+endmenu
+
 config ARCH_SPACEMIT
 	bool "SpacemiT SoCs"
 	select PINCTRL
