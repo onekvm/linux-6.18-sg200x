@@ -21,7 +21,9 @@
 #include <linux/seq_file.h>
 #include <linux/delay.h>
 #include <linux/io.h>
+#include <linux/jiffies.h>
 #include <linux/slab.h>
+#include <linux/workqueue.h>
 
 #include <linux/usb/ch9.h>
 #include <linux/usb/gadget.h>
@@ -949,18 +951,20 @@ static int dwc2_gadget_fill_isoc_desc(struct dwc2_hsotg_ep *hs_ep,
 		desc->status |= ((pid << DEV_DMA_ISOC_PID_SHIFT) &
 				 DEV_DMA_ISOC_PID_MASK) |
 				((len % hs_ep->ep.maxpacket) ?
-				 DEV_DMA_SHORT : 0) |
-				((hs_ep->target_frame <<
-				  DEV_DMA_ISOC_FRNUM_SHIFT) &
-				 DEV_DMA_ISOC_FRNUM_MASK);
+				 DEV_DMA_SHORT : 0);
 	}
+	/*
+	 * OUT descriptors need the expected microframe. FRNUM left at 0
+	 * never matches the host, and the core reports OUTPKTERR while
+	 * leaving the endpoint enabled.
+	 */
+	desc->status |= (hs_ep->target_frame << DEV_DMA_ISOC_FRNUM_SHIFT) &
+			DEV_DMA_ISOC_FRNUM_MASK;
 
 	desc->status &= ~DEV_DMA_BUFF_STS_MASK;
 	desc->status |= (DEV_DMA_BUFF_STS_HREADY << DEV_DMA_BUFF_STS_SHIFT);
 
-	/* Increment frame number by interval for IN */
-	if (hs_ep->dir_in)
-		dwc2_gadget_incr_frame_num(hs_ep);
+	dwc2_gadget_incr_frame_num(hs_ep);
 
 	/* Update index of last configured entry in the chain */
 	hs_ep->next_desc++;
@@ -1026,6 +1030,17 @@ static void dwc2_gadget_start_isoc_ddma(struct dwc2_hsotg_ep *hs_ep)
 
 	ctrl = dwc2_readl(hsotg, depctl);
 	ctrl |= DXEPCTL_EPENA | DXEPCTL_CNAK;
+	/*
+	 * SETEVENFR at ep_enable pins the endpoint to even microframes.
+	 * Match the descriptor frame so an odd host phase can be accepted.
+	 * These are write-1 action bits.
+	 */
+	if (!hs_ep->dir_in && hs_ep->isochronous) {
+		if (hs_ep->target_frame & 1)
+			ctrl |= DXEPCTL_SETODDFR;
+		else
+			ctrl |= DXEPCTL_SETEVENFR;
+	}
 	dwc2_writel(hsotg, ctrl, depctl);
 }
 
@@ -2217,6 +2232,34 @@ static void dwc2_gadget_complete_isoc_request_ddma(struct dwc2_hsotg_ep *hs_ep)
 			ureq->frame_number =
 				(desc_sts & DEV_DMA_ISOC_FRNUM_MASK) >>
 				DEV_DMA_ISOC_FRNUM_SHIFT;
+			/*
+			 * PIO paths are the only other total_data updates.
+			 * Descriptor DMA completions never reached them, so
+			 * the debugfs counter stayed at 0 even after a real
+			 * transfer. Count the bytes the descriptor returned.
+			 */
+			if (ureq->actual <= ureq->length)
+				hs_ep->total_data += ureq->actual;
+			if (!hs_ep->dir_in && ureq->actual &&
+			    ureq->actual <= ureq->length) {
+				bool first = !hs_ep->isoc_out_synced;
+
+				hs_ep->isoc_out_last = jiffies;
+				if (first) {
+					hs_ep->isoc_out_synced = true;
+					hs_ep->isoc_out_anchor = ureq->frame_number;
+					hs_ep->isoc_out_err = 0;
+					hs_ep->isoc_out_misses = 0;
+					hs_ep->isoc_out_next = 0;
+					mod_delayed_work(system_wq,
+							 &hs_ep->isoc_out_work,
+							 msecs_to_jiffies(50));
+					dev_info(hsotg->dev,
+						 "isoc-out ep%d locked frame %u len %u\n",
+						 hs_ep->index, ureq->frame_number,
+						 ureq->actual);
+				}
+			}
 		}
 
 		dwc2_hsotg_complete_request(hsotg, hs_ep, hs_req, 0);
@@ -2829,6 +2872,7 @@ static void dwc2_gadget_handle_ep_disabled(struct dwc2_hsotg_ep *hs_ep)
 	int dir_in = hs_ep->dir_in;
 	u32 epctl_reg = dir_in ? DIEPCTL(idx) : DOEPCTL(idx);
 	int dctl = dwc2_readl(hsotg, DCTL);
+	unsigned int guard = 0;
 
 	dev_dbg(hsotg->dev, "%s: EPDisbld\n", __func__);
 
@@ -2851,6 +2895,20 @@ static void dwc2_gadget_handle_ep_disabled(struct dwc2_hsotg_ep *hs_ep)
 		}
 	}
 
+	/*
+	 * Descriptor-DMA ISO OUT keeps its requests across a phase
+	 * resync. Completing them with -ENODATA makes u_audio requeue
+	 * from this interrupt, and the elapsed-frame loop then never
+	 * returns. OUTTKNEPDIS rebuilds the chain.
+	 */
+	if (!dir_in && using_desc_dma(hsotg) && hs_ep->isochronous) {
+		if (hs_ep->isoc_out_drop) {
+			hs_ep->isoc_out_drop = false;
+			hs_ep->target_frame = TARGET_FRAME_INITIAL;
+		}
+		return;
+	}
+
 	if (!hs_ep->isochronous)
 		return;
 
@@ -2871,7 +2929,296 @@ static void dwc2_gadget_handle_ep_disabled(struct dwc2_hsotg_ep *hs_ep)
 		dwc2_gadget_incr_frame_num(hs_ep);
 		/* Update current frame number value. */
 		hsotg->frame_number = dwc2_hsotg_read_frameno(hsotg);
+		if (++guard > 0x4000)
+			break;
 	} while (dwc2_gadget_target_frame_elapsed(hs_ep));
+}
+
+static void dwc2_gadget_isoc_out_allow_err(struct dwc2_hsotg *hsotg, bool on);
+static unsigned long dwc2_gadget_isoc_out_gap(struct dwc2_hsotg_ep *ep);
+static void dwc2_gadget_isoc_out_restart(struct dwc2_hsotg_ep *ep);
+
+static void dwc2_gadget_isoc_out_reset(struct dwc2_hsotg_ep *ep)
+{
+	ep->isoc_out_synced = false;
+	ep->isoc_out_drop = false;
+	ep->isoc_out_alive = false;
+	ep->isoc_out_adjust = 0;
+	ep->isoc_out_err = 0;
+	ep->isoc_out_rescue = 0;
+	ep->isoc_out_misses = 0;
+	ep->isoc_out_anchor = 0;
+	ep->isoc_out_sample = 0;
+	ep->isoc_out_next = 0;
+	ep->isoc_out_last = 0;
+	cancel_delayed_work(&ep->isoc_out_work);
+	if (!ep->dir_in && ep->isochronous)
+		dwc2_gadget_isoc_out_allow_err(ep->parent, false);
+}
+
+static u16 dwc2_gadget_isoc_frame_limit(struct dwc2_hsotg *hsotg)
+{
+	u16 limit = DSTS_SOFFN_LIMIT;
+
+	if (hsotg->gadget.speed != USB_SPEED_HIGH)
+		limit >>= 3;
+	return limit;
+}
+
+/*
+ * Program ISO OUT descriptors on the host microframe phase.
+ *
+ * The OUT token samples the frame. Interrupt latency makes that sample
+ * a few microframes late, so each OUTPKTERR steps the residue back by
+ * one. A completed descriptor locks the phase. The catch-up loop is
+ * capped so a wrapped frame number cannot spin in IRQ context.
+ */
+static void dwc2_gadget_schedule_isoc_out_ddma(struct dwc2_hsotg_ep *ep)
+{
+	struct dwc2_hsotg *hsotg = ep->parent;
+	u16 limit = dwc2_gadget_isoc_frame_limit(hsotg);
+	u32 now = dwc2_hsotg_read_frameno(hsotg);
+	u32 interval = ep->interval ? ep->interval : 1;
+	unsigned int guard = 0;
+
+	hsotg->frame_number = now;
+	ep->frame_overrun = false;
+
+	if (ep->isoc_out_synced) {
+		ep->target_frame = ep->isoc_out_anchor;
+		while (dwc2_gadget_target_frame_elapsed(ep) &&
+		       guard++ < 0x4000) {
+			dwc2_gadget_incr_frame_num(ep);
+			hsotg->frame_number = dwc2_hsotg_read_frameno(hsotg);
+		}
+	} else {
+		u32 residue = (ep->isoc_out_sample + ep->isoc_out_adjust) %
+			      interval;
+		u32 base = now + 2;
+		u32 delta;
+		u32 target;
+
+		if (base > limit) {
+			ep->frame_overrun = true;
+			base &= limit;
+		}
+		delta = (residue + interval - (base % interval)) % interval;
+		target = base + delta;
+		if (target > limit) {
+			ep->frame_overrun = true;
+			target &= limit;
+		}
+		ep->target_frame = target;
+	}
+
+	/*
+	 * Keep OUTPKTERR masked until the work item opens one sample.
+	 * Leaving it unmasked retakes the USB IRQ for every packet and
+	 * starves the network on this single core.
+	 */
+	dwc2_gadget_isoc_out_allow_err(hsotg, false);
+	dwc2_gadget_start_isoc_ddma(ep);
+	if (ep->isoc_out_synced) {
+		dwc2_gadget_isoc_out_allow_err(hsotg, true);
+		mod_delayed_work(system_wq, &ep->isoc_out_work,
+				 msecs_to_jiffies(50));
+	} else {
+		mod_delayed_work(system_wq, &ep->isoc_out_work,
+				 dwc2_gadget_isoc_out_gap(ep));
+	}
+}
+
+/*
+ * The descriptor chain stopped while requests are still queued. Disable
+ * the endpoint without polling, then rebuild from the locked phase.
+ */
+static void dwc2_gadget_isoc_out_restart(struct dwc2_hsotg_ep *ep)
+{
+	struct dwc2_hsotg *hsotg = ep->parent;
+	u32 ctrl;
+
+	if (!ep->isoc_out_alive || ep->isoc_out_drop)
+		return;
+
+	dwc2_gadget_isoc_out_allow_err(hsotg, false);
+	ctrl = dwc2_readl(hsotg, DOEPCTL(ep->index));
+	if (!(ctrl & DXEPCTL_EPENA)) {
+		ep->isoc_out_sample = dwc2_hsotg_read_frameno(hsotg);
+		dwc2_gadget_schedule_isoc_out_ddma(ep);
+		return;
+	}
+
+	ep->isoc_out_drop = true;
+	ep->isoc_out_rescue = 0;
+	dwc2_hsotg_en_gsint(hsotg, GINTSTS_GOUTNAKEFF);
+	if (!(dwc2_readl(hsotg, GINTSTS) & GINTSTS_GOUTNAKEFF))
+		dwc2_set_bit(hsotg, DCTL, DCTL_SGOUTNAK);
+	mod_delayed_work(system_wq, &ep->isoc_out_work, msecs_to_jiffies(2));
+}
+
+/* OUTPKTERR is one shared OUT mask bit. One observation at a time. */
+static void dwc2_gadget_isoc_out_allow_err(struct dwc2_hsotg *hsotg, bool on)
+{
+	u32 mask = dwc2_readl(hsotg, DOEPMSK);
+
+	if (on)
+		mask |= DXEPINT_OUTPKTERR;
+	else
+		mask &= ~DXEPINT_OUTPKTERR;
+	dwc2_writel(hsotg, mask, DOEPMSK);
+}
+
+static void dwc2_gadget_isoc_out_clear_err(struct dwc2_hsotg_ep *ep)
+{
+	dwc2_writel(ep->parent, DXEPINT_OUTPKTERR, DOEPINT(ep->index));
+}
+
+static unsigned long dwc2_gadget_isoc_out_gap(struct dwc2_hsotg_ep *ep)
+{
+	if (ep->isoc_out_misses >= 16)
+		return msecs_to_jiffies(1000);
+	if (ep->isoc_out_misses >= 8)
+		return msecs_to_jiffies(50);
+	return msecs_to_jiffies(2);
+}
+
+/*
+ * OUTPKTERR while ISO OUT DDMA is enabled: the packet microframe did
+ * not match the descriptor. Mask the interrupt, request a global OUT
+ * NAK, and return. Do not poll registers here.
+ */
+static void dwc2_gadget_isoc_out_missed(struct dwc2_hsotg_ep *ep)
+{
+	struct dwc2_hsotg *hsotg = ep->parent;
+	bool was_synced;
+	u32 interval;
+	u32 ctrl;
+
+	if (!using_desc_dma(hsotg) || ep->dir_in || !ep->isochronous ||
+	    !ep->isoc_out_alive)
+		return;
+
+	dwc2_gadget_isoc_out_allow_err(hsotg, false);
+	dwc2_gadget_isoc_out_clear_err(ep);
+
+	if (ep->isoc_out_drop)
+		return;
+	if (ep->isoc_out_next && time_before(jiffies, ep->isoc_out_next)) {
+		mod_delayed_work(system_wq, &ep->isoc_out_work,
+				 dwc2_gadget_isoc_out_gap(ep));
+		return;
+	}
+
+	was_synced = ep->isoc_out_synced;
+	if (was_synced) {
+		if (++ep->isoc_out_err < 4) {
+			mod_delayed_work(system_wq, &ep->isoc_out_work,
+					 msecs_to_jiffies(10));
+			return;
+		}
+		ep->isoc_out_synced = false;
+		ep->isoc_out_adjust = 0;
+		ep->isoc_out_misses = 0;
+	}
+
+	ctrl = dwc2_readl(hsotg, DOEPCTL(ep->index));
+	if (!(ctrl & DXEPCTL_EPENA))
+		return;
+
+	interval = ep->interval ? ep->interval : 1;
+	ep->isoc_out_drop = true;
+	ep->isoc_out_err = 0;
+	ep->isoc_out_rescue = 0;
+	ep->isoc_out_misses++;
+	if (!was_synced)
+		ep->isoc_out_adjust = (ep->isoc_out_adjust + interval - 1) %
+				      interval;
+	if (ep->isoc_out_misses >= 16)
+		ep->isoc_out_next = jiffies + msecs_to_jiffies(1000);
+	else if (ep->isoc_out_misses >= 8)
+		ep->isoc_out_next = jiffies + msecs_to_jiffies(50);
+
+	dwc2_hsotg_en_gsint(hsotg, GINTSTS_GOUTNAKEFF);
+	if (!(dwc2_readl(hsotg, GINTSTS) & GINTSTS_GOUTNAKEFF))
+		dwc2_set_bit(hsotg, DCTL, DCTL_SGOUTNAK);
+	mod_delayed_work(system_wq, &ep->isoc_out_work, msecs_to_jiffies(2));
+}
+
+/*
+ * GOUTNAKEFF did not disable the endpoint. One EPDIS write per try,
+ * with no register poll. After three tries, release the global NAK so
+ * the rest of the gadget keeps moving.
+ */
+static void dwc2_gadget_isoc_out_rescue(struct work_struct *work)
+{
+	struct dwc2_hsotg_ep *ep = container_of(work, struct dwc2_hsotg_ep,
+						 isoc_out_work.work);
+	struct dwc2_hsotg *hsotg = ep->parent;
+	unsigned long flags;
+	u32 ctrl;
+
+	spin_lock_irqsave(&hsotg->lock, flags);
+	if (!ep->isoc_out_alive)
+		goto out;
+
+	if (!ep->isoc_out_drop) {
+		/*
+		 * A locked stream whose frame was cleared, or whose
+		 * descriptor is no longer armed, is not moving. Rebuild
+		 * it. A descriptor still waiting (host silence) is left
+		 * alone.
+		 */
+		if (ep->isoc_out_synced && !list_empty(&ep->queue)) {
+			bool stuck = ep->target_frame == TARGET_FRAME_INITIAL;
+			u32 sts = 0;
+			u32 bs = DEV_DMA_BUFF_STS_HREADY;
+
+			if (ep->desc_list) {
+				sts = ep->desc_list[ep->compl_desc].status;
+				bs = (sts & DEV_DMA_BUFF_STS_MASK) >>
+				     DEV_DMA_BUFF_STS_SHIFT;
+			}
+			if (!stuck && ep->isoc_out_last &&
+			    time_after(jiffies, ep->isoc_out_last +
+				       msecs_to_jiffies(50)) &&
+			    bs != DEV_DMA_BUFF_STS_HREADY &&
+			    bs != DEV_DMA_BUFF_STS_DMABUSY)
+				stuck = true;
+			if (stuck) {
+				dwc2_gadget_isoc_out_restart(ep);
+				goto out;
+			}
+			mod_delayed_work(system_wq, &ep->isoc_out_work,
+					 msecs_to_jiffies(50));
+		}
+		dwc2_gadget_isoc_out_clear_err(ep);
+		dwc2_gadget_isoc_out_allow_err(hsotg, true);
+		goto out;
+	}
+
+	ctrl = dwc2_readl(hsotg, DOEPCTL(ep->index));
+	if (!(ctrl & DXEPCTL_EPENA))
+		goto out;
+
+	if (ep->isoc_out_rescue < 3) {
+		ep->isoc_out_rescue++;
+		dwc2_writel(hsotg, ctrl | DXEPCTL_EPDIS | DXEPCTL_SNAK,
+			    DOEPCTL(ep->index));
+		mod_delayed_work(system_wq, &ep->isoc_out_work,
+				 msecs_to_jiffies(2));
+		goto out;
+	}
+
+	if (dwc2_readl(hsotg, DCTL) & DCTL_GOUTNAKSTS)
+		dwc2_set_bit(hsotg, DCTL, DCTL_CGOUTNAK);
+	ep->isoc_out_drop = false;
+	ep->isoc_out_next = jiffies + msecs_to_jiffies(100);
+	dev_warn(hsotg->dev,
+		 "isoc-out ep%d stayed enabled after OUTPKTERR\n",
+		 ep->index);
+	mod_delayed_work(system_wq, &ep->isoc_out_work, msecs_to_jiffies(100));
+out:
+	spin_unlock_irqrestore(&hsotg->lock, flags);
 }
 
 /**
@@ -2895,11 +3242,16 @@ static void dwc2_gadget_handle_out_token_ep_disabled(struct dwc2_hsotg_ep *ep)
 		return;
 
 	if (using_desc_dma(hsotg)) {
-		if (ep->target_frame == TARGET_FRAME_INITIAL) {
-			/* Start first ISO Out */
-			ep->target_frame = hsotg->frame_number;
-			dwc2_gadget_start_isoc_ddma(ep);
-		}
+		u32 ctrl = dwc2_readl(hsotg, DOEPCTL(ep->index));
+
+		/*
+		 * A disabled endpoint is the only safe place to rebuild.
+		 * isoc_out_drop means EPDISBLD has not been handled yet.
+		 */
+		if ((ctrl & DXEPCTL_EPENA) || ep->isoc_out_drop)
+			return;
+		ep->isoc_out_sample = dwc2_hsotg_read_frameno(hsotg);
+		dwc2_gadget_schedule_isoc_out_ddma(ep);
 		return;
 	}
 
@@ -3059,6 +3411,9 @@ static void dwc2_hsotg_epint(struct dwc2_hsotg *hsotg, unsigned int idx,
 	dev_dbg(hsotg->dev, "%s: ep%d(%s) DxEPINT=0x%08x\n",
 		__func__, idx, dir_in ? "in" : "out", ints);
 
+	if (!dir_in && (ints & DXEPINT_OUTPKTERR))
+		dwc2_gadget_isoc_out_missed(hs_ep);
+
 	/* Don't process XferCompl interrupt if it is a setup packet */
 	if (idx == 0 && (ints & (DXEPINT_SETUP | DXEPINT_SETUP_RCVD)))
 		ints &= ~DXEPINT_XFERCOMPL;
@@ -3162,7 +3517,10 @@ static void dwc2_hsotg_epint(struct dwc2_hsotg *hsotg, unsigned int idx,
 
 	if (ints & DXEPINT_BNAINTR) {
 		dev_dbg(hsotg->dev, "%s: BNA interrupt\n", __func__);
-		if (hs_ep->isochronous)
+		if (hs_ep->isochronous && !dir_in && using_desc_dma(hsotg) &&
+		    hs_ep->isoc_out_alive)
+			dwc2_gadget_isoc_out_restart(hs_ep);
+		else if (hs_ep->isochronous)
 			dwc2_gadget_handle_isoc_bna(hs_ep);
 	}
 
@@ -4130,6 +4488,8 @@ static int dwc2_hsotg_ep_enable(struct usb_ep *ep,
 			dwc2_writel(hsotg, mask, DIEPMSK);
 		} else {
 			epctrl |= DXEPCTL_SNAK;
+			dwc2_gadget_isoc_out_reset(hs_ep);
+			hs_ep->isoc_out_alive = true;
 			mask = dwc2_readl(hsotg, DOEPMSK);
 			mask |= DOEPMSK_OUTTKNEPDISMSK;
 			dwc2_writel(hsotg, mask, DOEPMSK);
@@ -4288,6 +4648,8 @@ static int dwc2_hsotg_ep_disable(struct usb_ep *ep)
 	hsotg->fifo_map &= ~(1 << hs_ep->fifo_index);
 	hs_ep->fifo_index = 0;
 	hs_ep->fifo_size = 0;
+	dwc2_gadget_isoc_out_reset(hs_ep);
+	hs_ep->target_frame = TARGET_FRAME_INITIAL;
 
 	return 0;
 }
@@ -4827,6 +5189,7 @@ static void dwc2_hsotg_initep(struct dwc2_hsotg *hsotg,
 
 	INIT_LIST_HEAD(&hs_ep->queue);
 	INIT_LIST_HEAD(&hs_ep->ep.ep_list);
+	INIT_DELAYED_WORK(&hs_ep->isoc_out_work, dwc2_gadget_isoc_out_rescue);
 
 	/* add to the list of endpoints known by the gadget driver */
 	if (epnum)
