@@ -62,8 +62,17 @@
 			compatible = "thead,c906", "riscv";
 			/* /proc/cpuinfo "model name" and lscpu Model name. */
 			model-name = "T-Head XuanTie C906 (Sophgo SG2002)";
-			/* C906 implements draft XTheadVector, not ratified V 1.0. */
+			/*
+			 * C906 implements draft XTheadVector (VLEN=128), not
+			 * ratified V 1.0.  6.18 ignores vendor tokens in
+			 * riscv,isa; list xtheadvector and do not add "v".
+			 */
 			riscv,isa = "rv64imafdcsu";
+			riscv,isa-base = "rv64i";
+			riscv,isa-extensions = "i", "m", "a", "f", "d", "c",
+						 "zicntr", "zicsr", "zifencei",
+						 "zihpm", "xtheadvector";
+			thead,vlenb = <16>;
 			mmu-type = "riscv,sv39";
 			clocks = <&clk CV181X_CLK_C906_0>;
 

@@ -156,6 +156,24 @@ struct dwc2_hsotg_ep {
 	unsigned int		next_desc;
 	unsigned int		compl_desc;
 
+	/*
+	 * ISO OUT descriptor DMA. The host keeps one microframe phase;
+	 * OUTPKTERR leaves the endpoint enabled, so the phase has to be
+	 * relearned without waiting in the hard IRQ.
+	 */
+	unsigned int		isoc_out_synced:1;
+	unsigned int		isoc_out_drop:1;
+	unsigned int		isoc_out_alive:1;
+	u8			isoc_out_adjust;
+	u8			isoc_out_err;
+	u8			isoc_out_rescue;
+	unsigned int		isoc_out_misses;
+	u16			isoc_out_anchor;
+	u16			isoc_out_sample;
+	unsigned long		isoc_out_next;
+	unsigned long		isoc_out_last;
+	struct delayed_work	isoc_out_work;
+
 	char                    name[10];
 };
 

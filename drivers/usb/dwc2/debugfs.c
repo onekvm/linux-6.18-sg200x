@@ -255,6 +255,13 @@ static int ep_show(struct seq_file *seq, void *v)
 	seq_puts(seq, "\n");
 	seq_printf(seq, "mps %d\n", ep->ep.maxpacket);
 	seq_printf(seq, "total_data=%ld\n", ep->total_data);
+	if (ep->isochronous && !ep->dir_in)
+		seq_printf(seq,
+			   "isoc_out synced=%u drop=%u adjust=%u misses=%u sample=%u anchor=%u target=%x\n",
+			   ep->isoc_out_synced, ep->isoc_out_drop,
+			   ep->isoc_out_adjust, ep->isoc_out_misses,
+			   ep->isoc_out_sample, ep->isoc_out_anchor,
+			   ep->target_frame);
 
 	seq_printf(seq, "request list (%p,%p):\n",
 		   ep->queue.next, ep->queue.prev);
