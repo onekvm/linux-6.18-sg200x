@@ -30,11 +30,22 @@
 #include <linux/cdev.h>
 #include <linux/interrupt.h>
 #include <linux/scatterlist.h>
+#include <linux/mm.h>
+#include <linux/highmem.h>
 #include <linux/cvitek_spacc.h>
 #include "cvitek-spacc-regs.h"
 #include <linux/delay.h>
 #define DEVICE_NAME    "spacc"
 #define CVITEK_SPACC_KERNEL_BUFFER_SIZE (32 * 1024)
+
+static unsigned long spacc_ctr_inplace;
+static unsigned long spacc_ctr_bounce;
+module_param_named(ctr_inplace, spacc_ctr_inplace, ulong, 0444);
+MODULE_PARM_DESC(ctr_inplace,
+		 "AES-CTR jobs that DMA in-place (no kernel_buffer bounce)");
+module_param_named(ctr_bounce, spacc_ctr_bounce, ulong, 0444);
+MODULE_PARM_DESC(ctr_bounce,
+		 "AES-CTR jobs that bounce through kernel_buffer");
 
 struct cvi_spacc {
 	struct device *dev;
@@ -126,6 +137,15 @@ static inline void cvi_sha1_init(struct cvi_spacc *spacc)
 	spacc->state[4] = cpu_to_be32(0xC3D2E1F0);
 }
 
+static inline void abort_cryptodma_engine(struct cvi_spacc *spacc)
+{
+	iowrite32(0, spacc->spacc_base + CRYPTODMA_DMA_CTRL);
+	/* Flush the stop before clearing any completion latched while stopping. */
+	ioread32(spacc->spacc_base + CRYPTODMA_DMA_CTRL);
+	iowrite32(0x7, spacc->spacc_base + CRYPTODMA_WR_INT);
+	ioread32(spacc->spacc_base + CRYPTODMA_WR_INT);
+}
+
 static inline int trigger_cryptodma_engine_and_wait_finish(struct cvi_spacc *spacc)
 {
 	u32 status;
@@ -153,6 +173,7 @@ static inline int trigger_cryptodma_engine_and_wait_finish(struct cvi_spacc *spa
 			return 0;
 		cpu_relax();
 	} while (time_before(jiffies, deadline));
+	abort_cryptodma_engine(spacc);
 	return -ETIMEDOUT;
 }
 
@@ -411,6 +432,29 @@ bool cvitek_spacc_kernel_api_ready(void)
 }
 EXPORT_SYMBOL_GPL(cvitek_spacc_kernel_api_ready);
 
+static bool spacc_can_ctr_inplace(struct scatterlist *source,
+				  struct scatterlist *destination,
+				  unsigned int engine_length)
+{
+	void *addr;
+
+	if (!source || !destination)
+		return false;
+	if (sg_next(source) || sg_next(destination))
+		return false;
+	if (source->length < engine_length || destination->length < engine_length)
+		return false;
+	if (sg_page(source) != sg_page(destination) ||
+	    source->offset != destination->offset)
+		return false;
+	addr = sg_virt(source);
+	if (!addr || is_vmalloc_addr(addr) || !virt_addr_valid(addr))
+		return false;
+	if (!IS_ALIGNED((unsigned long)addr, AES_BLOCK_SIZE))
+		return false;
+	return true;
+}
+
 int cvitek_spacc_aes_ctr_encrypt_sg(struct scatterlist *source,
 				    struct scatterlist *destination,
 				    unsigned int length, const u8 *key,
@@ -422,6 +466,7 @@ int cvitek_spacc_aes_ctr_encrypt_sg(struct scatterlist *source,
 	int source_entries;
 	int destination_entries;
 	int error;
+	bool inplace;
 
 	if (!spacc)
 		return -ENODEV;
@@ -437,7 +482,24 @@ int cvitek_spacc_aes_ctr_encrypt_sg(struct scatterlist *source,
 	if (source_entries < 0 || destination_entries < 0)
 		return -EINVAL;
 
+	inplace = spacc_can_ctr_inplace(source, destination, engine_length);
 	mutex_lock(&spacc->engine_lock);
+	if (inplace) {
+		void *addr = sg_virt(source);
+
+		if (engine_length != length)
+			memset(addr + length, 0, engine_length - length);
+		buffer_phys = virt_to_phys(addr);
+		dma_sync_single_for_device(spacc->dev, (dma_addr_t)buffer_phys,
+					   engine_length, DMA_BIDIRECTIONAL);
+		error = spacc_aes_ctr_kernel(spacc, buffer_phys, engine_length,
+					     key, key_len, iv);
+		dma_sync_single_for_cpu(spacc->dev, (dma_addr_t)buffer_phys,
+					engine_length, DMA_BIDIRECTIONAL);
+		spacc_ctr_inplace++;
+		goto unlock;
+	}
+	spacc_ctr_bounce++;
 	if (sg_copy_to_buffer(source, source_entries, spacc->kernel_buffer,
 			      length) != length) {
 		error = -EFAULT;
@@ -465,6 +527,138 @@ unlock:
 	return error;
 }
 EXPORT_SYMBOL_GPL(cvitek_spacc_aes_ctr_encrypt_sg);
+
+int cvitek_spacc_aes_ctr_encrypt_phys(phys_addr_t buf, unsigned int length,
+				      const u8 *key, unsigned int key_len,
+				      const u8 *iv)
+{
+	struct cvi_spacc *spacc = READ_ONCE(cvitek_spacc_device);
+	unsigned int engine_length;
+	int error;
+
+	if (!spacc)
+		return -ENODEV;
+	if (!length)
+		return 0;
+	if (!key || !iv)
+		return -EINVAL;
+	engine_length = ALIGN(length, AES_BLOCK_SIZE);
+	if (engine_length > spacc->kernel_buffer_size)
+		return -EMSGSIZE;
+	mutex_lock(&spacc->engine_lock);
+	dma_sync_single_for_device(spacc->dev, (dma_addr_t)buf, engine_length,
+				   DMA_BIDIRECTIONAL);
+	error = spacc_aes_ctr_kernel(spacc, buf, engine_length, key, key_len,
+				     iv);
+	dma_sync_single_for_cpu(spacc->dev, (dma_addr_t)buf, engine_length,
+				DMA_BIDIRECTIONAL);
+	mutex_unlock(&spacc->engine_lock);
+	return error;
+}
+EXPORT_SYMBOL_GPL(cvitek_spacc_aes_ctr_encrypt_phys);
+
+struct cvitek_spacc_ctr_job {
+	void *buf;
+	unsigned int length;
+	const u8 *iv;
+};
+
+#define CVITEK_SPACC_DESC_WORDS 22
+#define CVITEK_SPACC_DESC_STRIDE 24
+#define CVITEK_SPACC_MAX_CHAIN 32
+
+int cvitek_spacc_aes_ctr_encrypt_many(struct cvitek_spacc_ctr_job *jobs,
+				      unsigned int count, const u8 *key,
+				      unsigned int key_len)
+{
+	struct cvi_spacc *spacc = READ_ONCE(cvitek_spacc_device);
+	unsigned int i;
+	unsigned int cipher_bits;
+	int error = 0;
+	phys_addr_t desc_phys;
+	size_t desc_bytes;
+
+	if (!spacc)
+		return -ENODEV;
+	if (!count)
+		return 0;
+	if (!jobs || !key)
+		return -EINVAL;
+	if (count > CVITEK_SPACC_MAX_CHAIN)
+		return -EINVAL;
+	switch (key_len) {
+	case 16:
+		cipher_bits = 0x1 << 5;
+		break;
+	case 24:
+		cipher_bits = 0x1 << 4;
+		break;
+	case 32:
+		cipher_bits = 0x1 << 3;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	mutex_lock(&spacc->engine_lock);
+	desc_bytes = count * CVITEK_SPACC_DESC_STRIDE * sizeof(u32);
+	if (desc_bytes > PAGE_SIZE) {
+		error = -ENOMEM;
+		goto unlock;
+	}
+	memset(spacc->descriptor, 0, desc_bytes);
+
+	for (i = 0; i < count; i++) {
+		u32 *d = spacc->descriptor + i * CVITEK_SPACC_DESC_STRIDE;
+		phys_addr_t buf_phys;
+		phys_addr_t next_phys;
+		unsigned int engine_length;
+
+		if (!jobs[i].buf || !jobs[i].length || !jobs[i].iv) {
+			error = -EINVAL;
+			goto unlock;
+		}
+		engine_length = ALIGN(jobs[i].length, AES_BLOCK_SIZE);
+		buf_phys = virt_to_phys(jobs[i].buf);
+		d[CRYPTODMA_CTRL] = DES_USE_DESCRIPTOR_KEY |
+			DES_USE_DESCRIPTOR_IV | DES_USE_AES | 0xF;
+		d[CRYPTODMA_CIPHER] = (0x1 << 2) | 0x1 | cipher_bits;
+		memcpy(&d[CRYPTODMA_KEY], key, key_len);
+		memcpy(&d[CRYPTODMA_IV], jobs[i].iv, AES_BLOCK_SIZE);
+		setup_src_dst(d, buf_phys, engine_length);
+		if (i + 1 < count) {
+			next_phys = virt_to_phys(spacc->descriptor +
+						 (i + 1) * CVITEK_SPACC_DESC_STRIDE);
+			d[CRYPTODMA_NEXT_PTR_ADDR_L] =
+				(u32)((u64)next_phys & 0xFFFFFFFF);
+			d[CRYPTODMA_NEXT_PTR_ADDR_H] =
+				(u32)((u64)next_phys >> 32);
+		}
+		dma_sync_single_for_device(spacc->dev, (dma_addr_t)buf_phys,
+					   engine_length, DMA_BIDIRECTIONAL);
+	}
+
+	desc_phys = virt_to_phys(spacc->descriptor);
+	dma_sync_single_for_device(spacc->dev, (dma_addr_t)desc_phys,
+				   desc_bytes, DMA_TO_DEVICE);
+	iowrite32((u32)((u64)desc_phys & 0xFFFFFFFF),
+		  spacc->spacc_base + CRYPTODMA_DES_BASE_L);
+	iowrite32((u32)((u64)desc_phys >> 32),
+		  spacc->spacc_base + CRYPTODMA_DES_BASE_H);
+	error = trigger_cryptodma_engine_and_wait_finish(spacc);
+	for (i = 0; i < count; i++) {
+		unsigned int engine_length = ALIGN(jobs[i].length, AES_BLOCK_SIZE);
+		phys_addr_t buf_phys = virt_to_phys(jobs[i].buf);
+
+		dma_sync_single_for_cpu(spacc->dev, (dma_addr_t)buf_phys,
+					engine_length, DMA_BIDIRECTIONAL);
+	}
+	memzero_explicit(spacc->descriptor, desc_bytes);
+unlock:
+	mutex_unlock(&spacc->engine_lock);
+	return error;
+}
+EXPORT_SYMBOL_GPL(cvitek_spacc_aes_ctr_encrypt_many);
 
 int spacc_sm4(struct cvi_spacc *spacc, phys_addr_t src, uint32_t len, spacc_sm4_config_s config)
 {
