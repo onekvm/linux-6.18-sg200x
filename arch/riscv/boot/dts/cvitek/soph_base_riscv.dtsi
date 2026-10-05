@@ -35,8 +35,6 @@
 	spacc: crypto@2060000 {
 		compatible = "cvitek,spacc";
 		reg = <0x0 0x02060000 0x0 0x200>;
-		interrupts = <59 IRQ_TYPE_LEVEL_HIGH>;
-		interrupt-parent = <&plic0>;
 		status = "okay";
 	};
 
@@ -64,8 +62,8 @@
 			model-name = "T-Head XuanTie C906 (Sophgo SG2002)";
 			/*
 			 * C906 implements draft XTheadVector (VLEN=128), not
-			 * ratified V 1.0.  6.18 ignores vendor tokens in
-			 * riscv,isa; list xtheadvector and do not add "v".
+			 * ratified V 1.0.  6.18 ignores vendor x… tokens in
+			 * riscv,isa; list xtheadvector here and do not add "v".
 			 */
 			riscv,isa = "rv64imafdcsu";
 			riscv,isa-base = "rv64i";

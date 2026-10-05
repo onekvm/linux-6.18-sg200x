@@ -41,7 +41,7 @@ menu "Cvitek platform settings"
 	depends on ARCH_SOPHGO
 
 config ION_SIZE_MIB
-	int "ION carveout size (MiB)" if ION_CVITEK
+	int "ION carveout size (MiB)"
 	range 22 112
 	default 48
 	help
