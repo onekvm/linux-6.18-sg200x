@@ -28,6 +28,7 @@
 };
 
 &sd {
+	cvitek,sd0-pwr-en-as-gpio;
         min-frequency = <400000>; // 400Khz
 	max-frequency = <50000000>; // 50Mhz
 	//max-frequency = <25000000>; // 25Mhz
@@ -177,27 +178,10 @@
         /delete-property/ mute-gpio-r;
 };
 
-/* NanoKVM has no CVI display output.  1440p H.264 needs ~51 MiB of ION
- * (UYVY×3 + NV21 VPSS×3 + WAVE4 recon); the old 48 MiB top-of-DRAM
- * carveout at 0x8ce00000 was too small.  U-Boot still parks the FIT
- * ramdisk/FDT around 0x8c01d000-0x8c43d6da and does not honor this
- * reserved-memory node (it logs "reserving fdt memory region failed"),
- * so ION must not cover that window and cannot grow downward from
- * 0x8fe00000 to 64 MiB.  Place 64 MiB below the U-Boot load area.
- * C906L stays at 0x8fe00000.  The OLED does not use the framebuffer.
+/* Keep the Linux memory, ION, and C906L reservations derived from the same
+ * configurable layout. The generator rejects U-Boot/FIT overlaps.
  */
-&ion_reserved {
-	reg = <0x0 0x85000000 0x0 0x04000000>;
-	/delete-property/ size;
-};
-
-&fb_reserved {
-        status = "disabled";
-};
-
-&cvi_fb {
-        status = "disabled";
-};
+#include "onekvm_nanokvm_ion_layout.dtsi"
 
 &mipi_rx {
         snsr-reset = <&porte 1 GPIO_ACTIVE_LOW>;
@@ -225,7 +209,7 @@
 		compatible = "i2c-gpio";
                 scl-gpios = <&porta 15 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
                 sda-gpios = <&porta 27 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
-                i2c-gpio,delay-us = <5>;
+		i2c-gpio,delay-us = <CVITEK_GPIO_I2C_DELAY_US>;
                 status = "okay";
 	};
 
@@ -244,7 +228,7 @@
 
 		led-user {
 			gpios = <&porta 14 GPIO_ACTIVE_HIGH>;
-			linux,default-trigger = "activity";
+			linux,default-trigger = "mmc0";
 		};
 	};
 
