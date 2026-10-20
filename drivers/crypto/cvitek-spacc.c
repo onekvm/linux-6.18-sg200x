@@ -6,6 +6,8 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <crypto/aes.h>
+#include <crypto/sha1.h>
+#include <linux/unaligned.h>
 #include <linux/bitops.h>
 #include <linux/clk.h>
 #include <linux/device.h>
@@ -47,6 +49,39 @@ module_param_named(ctr_bounce, spacc_ctr_bounce, ulong, 0444);
 MODULE_PARM_DESC(ctr_bounce,
 		 "AES-CTR jobs that bounce through kernel_buffer");
 
+/* Diagnostic switch permits an A/B test of the historical streaming path.
+ * Default coherent storage never shares cache lines with CPU-owned data. */
+static bool spacc_coherent_buffers = true;
+module_param_named(coherent_buffers, spacc_coherent_buffers, bool, 0444);
+static bool spacc_force_bounce;
+module_param_named(force_bounce, spacc_force_bounce, bool, 0644);
+static uint spacc_read_burst = DMA_READ_MAX_BURST;
+module_param_named(read_burst, spacc_read_burst, uint, 0444);
+static uint spacc_write_burst = DMA_WRITE_MAX_BURST;
+module_param_named(write_burst, spacc_write_burst, uint, 0444);
+static uint spacc_poll_interval_us = 1;
+module_param_named(poll_interval_us, spacc_poll_interval_us, uint, 0444);
+MODULE_PARM_DESC(poll_interval_us,
+		 "MMIO completion polling interval (0 restores unpaced diagnostic polling)");
+static unsigned long spacc_dma_jobs;
+module_param_named(dma_jobs, spacc_dma_jobs, ulong, 0444);
+static unsigned long spacc_dma_timeouts;
+module_param_named(dma_timeouts, spacc_dma_timeouts, ulong, 0444);
+static bool spacc_completion_diagnostics;
+module_param_named(completion_diagnostics, spacc_completion_diagnostics, bool, 0644);
+static unsigned long spacc_early_completions;
+module_param_named(early_completions, spacc_early_completions, ulong, 0444);
+static unsigned long spacc_busy_starts;
+module_param_named(busy_starts, spacc_busy_starts, ulong, 0444);
+static unsigned long spacc_unstable_sha1;
+module_param_named(unstable_sha1, spacc_unstable_sha1, ulong, 0444);
+static unsigned long spacc_unexpected_completions;
+module_param_named(unexpected_completions, spacc_unexpected_completions, ulong, 0444);
+static uint spacc_last_completion;
+module_param_named(last_completion, spacc_last_completion, uint, 0444);
+static uint spacc_last_expected_completion;
+module_param_named(last_expected_completion, spacc_last_expected_completion, uint, 0444);
+
 struct cvi_spacc {
 	struct device *dev;
 	struct cdev cdev;
@@ -64,6 +99,10 @@ struct cvi_spacc {
 	void *kernel_buffer;
 	u32 kernel_buffer_size;
 	u32 *descriptor;
+	dma_addr_t kernel_buffer_dma;
+	dma_addr_t descriptor_dma;
+	void *kernel_output;
+	dma_addr_t kernel_output_dma;
 
 #ifdef CONFIG_PM_SLEEP
 	struct clk *efuse_clk;
@@ -149,14 +188,21 @@ static inline void abort_cryptodma_engine(struct cvi_spacc *spacc)
 static inline int trigger_cryptodma_engine_and_wait_finish(struct cvi_spacc *spacc)
 {
 	u32 status;
+	u32 expected = spacc->descriptor[CRYPTODMA_CTRL] & DES_USE_SHA ? 2 : 1;
 	unsigned long deadline;
 
+	if (unlikely(spacc_completion_diagnostics) &&
+	    (ioread32(spacc->spacc_base + CRYPTODMA_DMA_CTRL) & DMA_ENABLE)) {
+		spacc_busy_starts++;
+		dev_warn_ratelimited(spacc->dev, "DMA still enabled before next job\n");
+	}
 	iowrite32(0x7, spacc->spacc_base + CRYPTODMA_INT_MASK);
 	/* Important!!! must do this */
 	iowrite32(0x7, spacc->spacc_base + CRYPTODMA_WR_INT);
 
-	iowrite32(DMA_WRITE_MAX_BURST << 24 |
-			  DMA_READ_MAX_BURST << 16 |
+	spacc_dma_jobs++;
+	iowrite32(spacc_write_burst << 24 |
+			  spacc_read_burst << 16 |
 			  DMA_DESCRIPTOR_MODE << 1 | DMA_ENABLE, spacc->spacc_base + CRYPTODMA_DMA_CTRL);
 
 	/*
@@ -168,11 +214,45 @@ static inline int trigger_cryptodma_engine_and_wait_finish(struct cvi_spacc *spa
 	 */
 	deadline = jiffies + msecs_to_jiffies(20);
 	do {
+		if (spacc_poll_interval_us)
+			udelay(spacc_poll_interval_us);
 		status = ioread32(spacc->spacc_base + CRYPTODMA_WR_INT);
-		if (status)
+		if (status) {
+			if (unlikely(spacc_completion_diagnostics)) {
+				spacc_last_completion = status;
+				spacc_last_expected_completion = expected;
+				if (status != expected) {
+					spacc_unexpected_completions++;
+					dev_warn_ratelimited(spacc->dev,
+						"unexpected DMA completion job=%lu status=%#x expected=%#x ctrl=%#x\n",
+						spacc_dma_jobs, status, expected,
+						ioread32(spacc->spacc_base + CRYPTODMA_DMA_CTRL));
+				}
+			}
+			if (unlikely(spacc_completion_diagnostics) &&
+			    (ioread32(spacc->spacc_base + CRYPTODMA_DMA_CTRL) & DMA_ENABLE)) {
+				spacc_early_completions++;
+				dev_warn_ratelimited(spacc->dev,
+					"completion status=%#x while DMA enabled\n", status);
+			}
+			dma_rmb();
 			return 0;
+		}
 		cpu_relax();
 	} while (time_before(jiffies, deadline));
+	/* A preemptible poller may resume after its deadline with a completed
+	 * job. Re-read the completion before aborting, as read_poll_timeout()
+	 * does; the last value above can precede a long deschedule. */
+	status = ioread32(spacc->spacc_base + CRYPTODMA_WR_INT);
+	if (status) {
+		dma_rmb();
+		return 0;
+	}
+	spacc_dma_timeouts++;
+	dev_warn_ratelimited(spacc->dev,
+		"DMA timeout job=%lu status=%#x ctrl=%#x; stopping engine before buffer reuse\n",
+		spacc_dma_jobs, status,
+		ioread32(spacc->spacc_base + CRYPTODMA_DMA_CTRL));
 	abort_cryptodma_engine(spacc);
 	return -ETIMEDOUT;
 }
@@ -207,10 +287,14 @@ static inline void setup_dma_descriptor(struct cvi_spacc *spacc, uint32_t *dma_d
 	 * comes back on.
 	 */
 	memcpy(spacc->descriptor, dma_descriptor, 4 * 22);
-	descriptor_phys = virt_to_phys(spacc->descriptor);
-
-	dma_sync_single_for_device(spacc->dev, (dma_addr_t)descriptor_phys,
-				   4 * 22, DMA_TO_DEVICE);
+	if (spacc_coherent_buffers) {
+		descriptor_phys = spacc->descriptor_dma;
+		dma_wmb();
+	} else {
+		descriptor_phys = virt_to_phys(spacc->descriptor);
+		dma_sync_single_for_device(spacc->dev, descriptor_phys,
+					   4 * 22, DMA_TO_DEVICE);
+	}
 
 	// set dma descriptor addr
 	iowrite32((uint32_t)((uint64_t)descriptor_phys & 0xFFFFFFFF), spacc->spacc_base + CRYPTODMA_DES_BASE_L);
@@ -395,6 +479,7 @@ int spacc_aes(struct cvi_spacc *spacc, phys_addr_t src, uint32_t len, spacc_aes_
 }
 
 static int spacc_aes_ctr_kernel(struct cvi_spacc *spacc, phys_addr_t buffer,
+				phys_addr_t destination,
 				unsigned int len, const u8 *key,
 				unsigned int key_len, const u8 *iv)
 {
@@ -420,6 +505,8 @@ static int spacc_aes_ctr_kernel(struct cvi_spacc *spacc, phys_addr_t buffer,
 	memcpy(&dma_descriptor[CRYPTODMA_KEY], key, key_len);
 	memcpy(&dma_descriptor[CRYPTODMA_IV], iv, AES_BLOCK_SIZE);
 	setup_src_dst(dma_descriptor, buffer, len);
+	dma_descriptor[CRYPTODMA_DST_ADDR_L] = lower_32_bits(destination);
+	dma_descriptor[CRYPTODMA_DST_ADDR_H] = upper_32_bits(destination);
 	setup_dma_descriptor(spacc, dma_descriptor);
 	error = trigger_cryptodma_engine_and_wait_finish(spacc);
 	memzero_explicit(dma_descriptor, sizeof(dma_descriptor));
@@ -431,6 +518,19 @@ bool cvitek_spacc_kernel_api_ready(void)
 	return READ_ONCE(cvitek_spacc_device) != NULL;
 }
 EXPORT_SYMBOL_GPL(cvitek_spacc_kernel_api_ready);
+
+bool cvitek_spacc_concurrent_h265_ready(void)
+{
+	/* In-place CryptoDMA read/write hard-locks SG2002 under active H.265.
+	 * Only advertise the tested coherent, distinct-output profile. These
+	 * parameters are read-only so a cached capability cannot become stale.
+	 * The offload layer separately excludes chaining and RTOS GHASH. */
+	return cvitek_spacc_kernel_api_ready() && spacc_coherent_buffers &&
+		spacc_read_burst == DMA_READ_MAX_BURST &&
+		spacc_write_burst == DMA_WRITE_MAX_BURST &&
+		spacc_poll_interval_us == 1;
+}
+EXPORT_SYMBOL_GPL(cvitek_spacc_concurrent_h265_ready);
 
 static bool spacc_can_ctr_inplace(struct scatterlist *source,
 				  struct scatterlist *destination,
@@ -467,6 +567,8 @@ int cvitek_spacc_aes_ctr_encrypt_sg(struct scatterlist *source,
 	int destination_entries;
 	int error;
 	bool inplace;
+	bool separate;
+	void *result;
 
 	if (!spacc)
 		return -ENODEV;
@@ -482,7 +584,12 @@ int cvitek_spacc_aes_ctr_encrypt_sg(struct scatterlist *source,
 	if (source_entries < 0 || destination_entries < 0)
 		return -EINVAL;
 
-	inplace = spacc_can_ctr_inplace(source, destination, engine_length);
+	inplace = !spacc_coherent_buffers && !spacc_force_bounce &&
+		spacc_can_ctr_inplace(source, destination, engine_length);
+	/* Keep caller-visible in-place semantics, with distinct hardware
+	 * input/output addresses while video DMA is active. */
+	separate = spacc_coherent_buffers;
+	result = separate ? spacc->kernel_output : spacc->kernel_buffer;
 	mutex_lock(&spacc->engine_lock);
 	if (inplace) {
 		void *addr = sg_virt(source);
@@ -492,7 +599,7 @@ int cvitek_spacc_aes_ctr_encrypt_sg(struct scatterlist *source,
 		buffer_phys = virt_to_phys(addr);
 		dma_sync_single_for_device(spacc->dev, (dma_addr_t)buffer_phys,
 					   engine_length, DMA_BIDIRECTIONAL);
-		error = spacc_aes_ctr_kernel(spacc, buffer_phys, engine_length,
+		error = spacc_aes_ctr_kernel(spacc, buffer_phys, buffer_phys, engine_length,
 					     key, key_len, iv);
 		dma_sync_single_for_cpu(spacc->dev, (dma_addr_t)buffer_phys,
 					engine_length, DMA_BIDIRECTIONAL);
@@ -508,25 +615,106 @@ int cvitek_spacc_aes_ctr_encrypt_sg(struct scatterlist *source,
 	if (engine_length != length)
 		memset(spacc->kernel_buffer + length, 0,
 		       engine_length - length);
-	buffer_phys = virt_to_phys(spacc->kernel_buffer);
-	dma_sync_single_for_device(spacc->dev, (dma_addr_t)buffer_phys,
-				   engine_length, DMA_BIDIRECTIONAL);
-	error = spacc_aes_ctr_kernel(spacc, buffer_phys, engine_length, key,
+	buffer_phys = spacc_coherent_buffers ? spacc->kernel_buffer_dma :
+		virt_to_phys(spacc->kernel_buffer);
+	if (spacc_coherent_buffers)
+		dma_wmb();
+	else
+		dma_sync_single_for_device(spacc->dev, buffer_phys,
+					   engine_length, DMA_BIDIRECTIONAL);
+	error = spacc_aes_ctr_kernel(spacc, buffer_phys,
+				     separate ? spacc->kernel_output_dma : buffer_phys,
+				     engine_length, key,
 				     key_len, iv);
-	dma_sync_single_for_cpu(spacc->dev, (dma_addr_t)buffer_phys,
-				engine_length, DMA_BIDIRECTIONAL);
+	if (spacc_coherent_buffers)
+		dma_rmb();
+	else
+		dma_sync_single_for_cpu(spacc->dev, buffer_phys,
+					engine_length, DMA_BIDIRECTIONAL);
 	if (error)
 		goto clear_buffer;
 	if (sg_copy_from_buffer(destination, destination_entries,
-				spacc->kernel_buffer, length) != length)
+				result, length) != length)
 		error = -EFAULT;
 clear_buffer:
 	memzero_explicit(spacc->kernel_buffer, engine_length);
+	if (separate)
+		memzero_explicit(spacc->kernel_output, engine_length);
 unlock:
 	mutex_unlock(&spacc->engine_lock);
 	return error;
 }
 EXPORT_SYMBOL_GPL(cvitek_spacc_aes_ctr_encrypt_sg);
+
+/* One synchronous SHA-1 digest, including padding, with no shared hash state.
+ * HMAC callers use this for the inner and outer digest. Keep the engine lock
+ * across descriptor publication, DMA completion and result collection. */
+int cvitek_spacc_sha1_digest(const u8 *data, unsigned int length, u8 *digest)
+{
+	struct cvi_spacc *spacc = READ_ONCE(cvitek_spacc_device);
+	u32 descriptor[22] = { 0 };
+	u32 initial[5] = { SHA1_H0, SHA1_H1, SHA1_H2, SHA1_H3, SHA1_H4 };
+	unsigned int padded = ALIGN(length + 9, SHA1_BLOCK_SIZE);
+	phys_addr_t physical;
+	unsigned int i;
+	int error;
+
+	if (!spacc)
+		return -ENODEV;
+	if (!digest || (!data && length))
+		return -EINVAL;
+	if (length > CVITEK_SPACC_KERNEL_BUFFER_SIZE - 72 ||
+	    padded > spacc->kernel_buffer_size)
+		return -EMSGSIZE;
+	mutex_lock(&spacc->engine_lock);
+	memset(spacc->kernel_buffer, 0, padded);
+	if (length)
+		memcpy(spacc->kernel_buffer, data, length);
+	((u8 *)spacc->kernel_buffer)[length] = 0x80;
+	put_unaligned_be64((u64)length * 8,
+			   (u8 *)spacc->kernel_buffer + padded - 8);
+	descriptor[CRYPTODMA_CTRL] = DES_USE_DESCRIPTOR_KEY | DES_USE_SHA | 0xF;
+	descriptor[CRYPTODMA_CIPHER] = 1;
+	for (i = 0; i < ARRAY_SIZE(initial); i++)
+		descriptor[CRYPTODMA_KEY + i] = cpu_to_be32(initial[i]);
+	physical = spacc_coherent_buffers ? spacc->kernel_buffer_dma :
+		virt_to_phys(spacc->kernel_buffer);
+	if (spacc_coherent_buffers)
+		dma_wmb();
+	else
+		dma_sync_single_for_device(spacc->dev, physical, padded, DMA_TO_DEVICE);
+	descriptor[CRYPTODMA_SRC_LEN] = padded;
+	descriptor[CRYPTODMA_SRC_ADDR_L] = lower_32_bits(physical);
+	descriptor[CRYPTODMA_SRC_ADDR_H] = upper_32_bits(physical);
+	setup_dma_descriptor(spacc, descriptor);
+	error = trigger_cryptodma_engine_and_wait_finish(spacc);
+	if (!error) {
+		for (i = 0; i < SHA1_DIGEST_SIZE / sizeof(u32); i++)
+			put_unaligned(ioread32(spacc->spacc_base + CRYPTODMA_SHA_PARA + i * 4),
+				      (u32 *)(digest + i * 4));
+		if (unlikely(spacc_completion_diagnostics)) {
+			u8 again[SHA1_DIGEST_SIZE];
+
+			for (i = 0; i < SHA1_DIGEST_SIZE / sizeof(u32); i++)
+				put_unaligned(ioread32(spacc->spacc_base + CRYPTODMA_SHA_PARA + i * 4),
+					      (u32 *)(again + i * 4));
+			if (memcmp(digest, again, sizeof(again))) {
+				spacc_unstable_sha1++;
+				dev_warn_ratelimited(spacc->dev,
+					"SHA1 result changed after completion\n");
+			}
+			memzero_explicit(again, sizeof(again));
+		}
+	}
+	if (!spacc_coherent_buffers)
+		dma_sync_single_for_cpu(spacc->dev, physical, padded, DMA_TO_DEVICE);
+	memzero_explicit(spacc->kernel_buffer, padded);
+	memzero_explicit(spacc->descriptor, sizeof(descriptor));
+	memzero_explicit(descriptor, sizeof(descriptor));
+	mutex_unlock(&spacc->engine_lock);
+	return error;
+}
+EXPORT_SYMBOL_GPL(cvitek_spacc_sha1_digest);
 
 int cvitek_spacc_aes_ctr_encrypt_phys(phys_addr_t buf, unsigned int length,
 				      const u8 *key, unsigned int key_len,
@@ -545,10 +733,20 @@ int cvitek_spacc_aes_ctr_encrypt_phys(phys_addr_t buf, unsigned int length,
 	engine_length = ALIGN(length, AES_BLOCK_SIZE);
 	if (engine_length > spacc->kernel_buffer_size)
 		return -EMSGSIZE;
+	if (spacc_coherent_buffers) {
+		struct scatterlist data;
+		void *address = phys_to_virt(buf);
+
+		if (!virt_addr_valid(address))
+			return -EINVAL;
+		sg_init_one(&data, address, length);
+		return cvitek_spacc_aes_ctr_encrypt_sg(&data, &data, length,
+						     key, key_len, iv);
+	}
 	mutex_lock(&spacc->engine_lock);
 	dma_sync_single_for_device(spacc->dev, (dma_addr_t)buf, engine_length,
 				   DMA_BIDIRECTIONAL);
-	error = spacc_aes_ctr_kernel(spacc, buf, engine_length, key, key_len,
+	error = spacc_aes_ctr_kernel(spacc, buf, buf, engine_length, key, key_len,
 				     iv);
 	dma_sync_single_for_cpu(spacc->dev, (dma_addr_t)buf, engine_length,
 				DMA_BIDIRECTIONAL);
@@ -584,6 +782,8 @@ int cvitek_spacc_aes_ctr_encrypt_many(struct cvitek_spacc_ctr_job *jobs,
 		return 0;
 	if (!jobs || !key)
 		return -EINVAL;
+	if (spacc_coherent_buffers)
+		return -EOPNOTSUPP;
 	if (count > CVITEK_SPACC_MAX_CHAIN)
 		return -EINVAL;
 	switch (key_len) {
@@ -1049,18 +1249,30 @@ static int cvitek_spacc_drv_probe(struct platform_device *pdev)
 	} else {
 		dev_info(dev, "no routed IRQ, using completion polling\n");
 	}
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+	if (ret)
+		return ret;
 	spacc->kernel_buffer_size = CVITEK_SPACC_KERNEL_BUFFER_SIZE;
-	spacc->kernel_buffer = (void *)__get_free_pages(
-		GFP_KERNEL | GFP_DMA | __GFP_ZERO,
-		get_order(spacc->kernel_buffer_size));
-	if (!spacc->kernel_buffer)
-		return -ENOMEM;
-	spacc->descriptor = (u32 *)__get_free_page(GFP_KERNEL | GFP_DMA | __GFP_ZERO);
-	if (!spacc->descriptor) {
-		free_pages((unsigned long)spacc->kernel_buffer,
-			   get_order(spacc->kernel_buffer_size));
-		spacc->kernel_buffer = NULL;
-		return -ENOMEM;
+	if (spacc_coherent_buffers) {
+		spacc->kernel_buffer = dma_alloc_coherent(dev,
+			spacc->kernel_buffer_size, &spacc->kernel_buffer_dma,
+			GFP_KERNEL);
+		spacc->descriptor = dma_alloc_coherent(dev, PAGE_SIZE,
+			&spacc->descriptor_dma, GFP_KERNEL);
+		spacc->kernel_output = dma_alloc_coherent(dev,
+			spacc->kernel_buffer_size, &spacc->kernel_output_dma,
+			GFP_KERNEL);
+	} else {
+		spacc->kernel_buffer = (void *)__get_free_pages(
+			GFP_KERNEL | GFP_DMA | __GFP_ZERO,
+			get_order(spacc->kernel_buffer_size));
+		spacc->descriptor = (u32 *)__get_free_page(
+			GFP_KERNEL | GFP_DMA | __GFP_ZERO);
+	}
+	if (!spacc->kernel_buffer || !spacc->descriptor ||
+	    (spacc_coherent_buffers && !spacc->kernel_output)) {
+		ret = -ENOMEM;
+		goto failed_mem;
 	}
 
 	ret = alloc_chrdev_region(&spacc->tdev, 0, 1, DEVICE_NAME);
@@ -1088,13 +1300,26 @@ static int cvitek_spacc_drv_probe(struct platform_device *pdev)
 failed_chrdev:
 	unregister_chrdev_region(spacc->tdev, 1);
 failed_mem:
+	if (spacc->kernel_output) {
+		dma_free_coherent(spacc->dev, spacc->kernel_buffer_size,
+				  spacc->kernel_output, spacc->kernel_output_dma);
+		spacc->kernel_output = NULL;
+	}
 	if (spacc->descriptor) {
-		free_page((unsigned long)spacc->descriptor);
+		if (spacc_coherent_buffers)
+			dma_free_coherent(spacc->dev, PAGE_SIZE, spacc->descriptor,
+					  spacc->descriptor_dma);
+		else
+			free_page((unsigned long)spacc->descriptor);
 		spacc->descriptor = NULL;
 	}
 	if (spacc->kernel_buffer) {
-		free_pages((unsigned long)spacc->kernel_buffer,
-			   get_order(spacc->kernel_buffer_size));
+		if (spacc_coherent_buffers)
+			dma_free_coherent(spacc->dev, spacc->kernel_buffer_size,
+					  spacc->kernel_buffer, spacc->kernel_buffer_dma);
+		else
+			free_pages((unsigned long)spacc->kernel_buffer,
+				   get_order(spacc->kernel_buffer_size));
 		spacc->kernel_buffer = NULL;
 	}
 	return ret ? ret : -ENOMEM;
@@ -1108,6 +1333,11 @@ static void cvitek_spacc_drv_remove(struct platform_device *pdev)
 		return;
     }
 	WRITE_ONCE(cvitek_spacc_device, NULL);
+	if (spacc->kernel_output) {
+		dma_free_coherent(spacc->dev, spacc->kernel_buffer_size,
+				  spacc->kernel_output, spacc->kernel_output_dma);
+		spacc->kernel_output = NULL;
+	}
     if (spacc->spacc_class && !IS_ERR(spacc->spacc_class)) {
         device_destroy(spacc->spacc_class, spacc->tdev);
         class_destroy(spacc->spacc_class);
@@ -1122,12 +1352,20 @@ static void cvitek_spacc_drv_remove(struct platform_device *pdev)
         spacc->buffer_size = 0;
     }
 	if (spacc->descriptor) {
-		free_page((unsigned long)spacc->descriptor);
+		if (spacc_coherent_buffers)
+			dma_free_coherent(spacc->dev, PAGE_SIZE, spacc->descriptor,
+					  spacc->descriptor_dma);
+		else
+			free_page((unsigned long)spacc->descriptor);
 		spacc->descriptor = NULL;
 	}
 	if (spacc->kernel_buffer) {
-		free_pages((unsigned long)spacc->kernel_buffer,
-			   get_order(spacc->kernel_buffer_size));
+		if (spacc_coherent_buffers)
+			dma_free_coherent(spacc->dev, spacc->kernel_buffer_size,
+					  spacc->kernel_buffer, spacc->kernel_buffer_dma);
+		else
+			free_pages((unsigned long)spacc->kernel_buffer,
+				   get_order(spacc->kernel_buffer_size));
 		spacc->kernel_buffer = NULL;
 		spacc->kernel_buffer_size = 0;
 	}
