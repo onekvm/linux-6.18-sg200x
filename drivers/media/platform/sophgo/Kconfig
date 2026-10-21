@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config VIDEO_SOPHGO_VDEC
+	tristate "Sophgo SG2002 stateful video decoder interface"
+	depends on V4L_MEM2MEM_DRIVERS && VIDEO_DEV
+	depends on RISCV || COMPILE_TEST
+	select VIDEOBUF2_VMALLOC
+	select V4L2_MEM2MEM_DEV
+	select V4L2_JPEG_HELPER
+	help
+	  V4L2 memory-to-memory decoding interface for SG2002. A hardware
+	  backend registers the codec operations with this driver. The
+	  SG2002 vendor codec driver supplies H.264 and baseline JPEG decode
+	  operations; capture and encoding remain separate interfaces.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called sophgo-vdec.
