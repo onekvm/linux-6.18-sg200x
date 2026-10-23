@@ -29,6 +29,10 @@
 
 &sd {
 	cvitek,sd0-pwr-en-as-gpio;
+	/* The SD divider is fed by CLK_SD0 (100 MHz); 375 MHz is the
+	 * AXI/register clock and would make a requested 50 MHz card clock
+	 * run at roughly 12.5 MHz electrically. */
+	src-frequency = <100000000>;
         min-frequency = <400000>; // 400Khz
 	max-frequency = <50000000>; // 50Mhz
 	//max-frequency = <25000000>; // 25Mhz
@@ -248,14 +252,15 @@
                 bus-width = <4>;
                 reg = <0x0 0x4320000 0x0 0x1000>;
                 reg_names = "core_mem";
-                src-frequency = <375000000>;
+                /* Match the 100 MHz CLK_SD1 functional clock used by
+                 * the SDHCI divider; 375 MHz is the AXI clock. */
+                src-frequency = <100000000>;
                 min-frequency = <400000>; // 400Khz
-                //max-frequency = <50000000>; // 50Mhz
+                max-frequency = <50000000>; // 50Mhz
                 //max-frequency = <45000000>; // 45Mhz
                 //max-frequency = <40000000>; // 40Mhz
                 //max-frequency = <35000000>; // 35Mhz
                 //max-frequency = <30000000>; // 30Mhz
-                max-frequency = <25000000>; // 25Mhz
                 //max-frequency = <20000000>; // 20Mhz
                 //max-frequency = <15000000>; // 15Mhz
                 //max-frequency = <10000000>; // 10Mhz
